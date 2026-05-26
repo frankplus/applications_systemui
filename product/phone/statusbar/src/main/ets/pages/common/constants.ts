@@ -17,4 +17,5 @@ export default class Constants {
   static readonly TOUCHTYPE_DOWN = 0;
   static readonly TOUCHTYPE_UP = 1;
   static readonly TOUCHTYPE_MOVE = 2;
+  static readonly TOUCHTYPE_CANCEL = 3;
 }

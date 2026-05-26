@@ -33,7 +33,9 @@ import AbilityManager from '../../../../../../../common/src/main/ets/default/abi
 import { ConfigInfo } from '@ohos/common';
 
 const TAG = 'StatusBar-Index'
-const SLIDING_STATUS_BAR_DISTANCE = 18
+// Lowered from 18 so the panel starts following the finger almost
+// immediately. Anything ≥3vp is past tap-jitter for a deliberate drag.
+const SLIDING_STATUS_BAR_DISTANCE = 3
 
 let mHeightConfigUtils = new HeightConfigUtils();
 
@@ -49,6 +51,10 @@ struct Index {
   @StorageLink('StatusCoefficient') StatusCoefficient: number = 1.0
   mClearCallback: unsubscribe | undefined
   dropdownpanelIsOpen:boolean = false
+  dragArea: string = ''
+  dragLastY: number = 0
+  dragLastT: number = 0
+  dragVelocityY: number = 0
   onBackPress(): boolean {
     return true;
   }
@@ -119,22 +125,56 @@ struct Index {
 
   touchEvent(event: TouchEvent) {
     Trace.start(Trace.CORE_METHOD_START_TOUCHEVENT);
-    Log.showDebug(TAG, 'touchEvent' + event.touches)
     if (event.type == Constants.TOUCHTYPE_DOWN) { //down
       this.startX = event.touches[0].screenX
       this.startY = event.touches[0].screenY
+      this.dragArea = ''
+      this.dragLastY = this.startY
+      this.dragLastT = Date.now()
+      this.dragVelocityY = 0
       Log.showInfo(TAG, `touchStart, startX: ${this.startX}, startY: ${this.startY}`)
     } else if (event.type == Constants.TOUCHTYPE_MOVE) { //move
-      this.moveX = event.touches[0].screenX - this.startX
-      this.moveY = event.touches[0].screenY - this.startY
-      if (this.moveY > SLIDING_STATUS_BAR_DISTANCE && !this.dropdownpanelIsOpen) {
-        this.dropdownpanelIsOpen=true
-        this.onDropdown();
-        this.moveY = 0;
+      const curY = event.touches[0].screenY
+      const dyTotal = curY - this.startY
+      this.moveY = dyTotal
+      // velocity = px in last frame / ms in last frame * 1000 (px/s)
+      const now = Date.now()
+      const dt = Math.max(now - this.dragLastT, 1)
+      const dyFrame = curY - this.dragLastY
+      this.dragVelocityY = (dyFrame / dt) * 1000
+      this.dragLastY = curY
+      this.dragLastT = now
+      if (!this.dropdownpanelIsOpen && dyTotal > SLIDING_STATUS_BAR_DISTANCE) {
+        // Threshold crossed: decide area once and emit drag start
+        if (!this.mStatusBarData.showHorizontal || !this.mStatusBarData.ableToMaximize) {
+          return
+        }
+        if (this.checkDropdownShowStatus(StatusbarConfig.dropdownRanges?.notification as DropdownRange)) {
+          this.dragArea = 'left'
+        } else if (this.checkDropdownShowStatus(StatusbarConfig.dropdownRanges?.control as DropdownRange)) {
+          this.dragArea = 'right'
+        }
+        if (this.dragArea) {
+          this.dropdownpanelIsOpen = true
+          EventManager.publish(obtainLocalEvent('DropdownDragStart', {
+            area: this.dragArea, dy: vp2px(dyTotal), velocityY: vp2px(this.dragVelocityY)
+          }))
+        }
+      } else if (this.dropdownpanelIsOpen) {
+        EventManager.publish(obtainLocalEvent('DropdownDragUpdate', {
+          area: this.dragArea, dy: vp2px(dyTotal), velocityY: vp2px(this.dragVelocityY)
+        }))
       }
-    } else if (event.type == Constants.TOUCHTYPE_UP) { //up
+    } else if (event.type == Constants.TOUCHTYPE_UP || event.type == Constants.TOUCHTYPE_CANCEL) { //up / cancel
+      if (this.dropdownpanelIsOpen) {
+        const dyTotal = event.touches[0] ? event.touches[0].screenY - this.startY : this.moveY
+        EventManager.publish(obtainLocalEvent('DropdownDragEnd', {
+          area: this.dragArea, dy: vp2px(dyTotal), velocityY: vp2px(this.dragVelocityY)
+        }))
+      }
       this.dropdownpanelIsOpen = false
-      Log.showInfo(TAG, `touchEnd, moveX: ${this.moveX}, moveY: ${this.moveY}`)
+      this.dragArea = ''
+      Log.showInfo(TAG, `touchEnd, moveY: ${this.moveY}, vY: ${this.dragVelocityY}`)
       Trace.end(Trace.CORE_METHOD_START_TOUCHEVENT)
     }
   }
