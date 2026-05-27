@@ -56,8 +56,13 @@ export interface RecognizerConfig {
 }
 
 export interface RecognizerCallbacks {
-  onTrackingStart?: () => void;
-  onProgress?: (displacementVp: number, mode: ProgressMode) => void;
+  onTrackingStart?: (startXPx: number, startYPx: number) => void;
+  onProgress?: (
+    displacementVp: number,
+    mode: ProgressMode,
+    lastXPx: number,
+    lastYPx: number,
+  ) => void;
   onCommit: (target: GestureEndTarget, info: CommitInfo) => void;
   onReset?: () => void;
 }
@@ -193,14 +198,14 @@ export class SwipeRecognizer {
       }
       this.state = State.TRACKING_VERTICAL;
       p.trackingStartFired = true;
-      this.cbs.onTrackingStart?.();
+      this.cbs.onTrackingStart?.(p.startX, p.startY);
     }
 
     // We're TRACKING_VERTICAL now. Drive dock peek-in and motion-pause.
     if (deltaVp >= this.cfg.dockShowAfterVp) {
       if (!p.dockPeekFired) p.dockPeekFired = true;
       const mode: ProgressMode = deltaVp >= this.cfg.minDeltaRecentsVp ? 'recents' : 'home';
-      this.cbs.onProgress?.(deltaVp, mode);
+      this.cbs.onProgress?.(deltaVp, mode, x, y);
     }
 
     const speedVpPerMs = Math.abs(this.speedTracker.computeCurrentVelocity()) / this.cfg.vpToPx;

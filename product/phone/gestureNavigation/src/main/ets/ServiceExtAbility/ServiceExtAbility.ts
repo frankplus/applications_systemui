@@ -32,6 +32,8 @@ import {
   ProgressMode,
 } from '../recognizer/SwipeRecognizer';
 import { DEFAULT_MOTION_PAUSE_CONFIG } from '../recognizer/MotionPauseDetector';
+import { SnapshotCapture } from '../animation/SnapshotCapture';
+import { DragController } from '../animation/DragController';
 
 const TAG = 'GestureNavigation_ServiceExtAbility';
 
@@ -103,6 +105,15 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private dockWindow: window.Window | null = null;
   private dockShown = false;
 
+  private dragWindow: window.Window | null = null;
+  private dragShown = false;
+  private snapshotCapture: SnapshotCapture = new SnapshotCapture();
+  private dragController: DragController | null = null;
+  // True from onCommit until the post-spring teardown completes —
+  // suppresses the synchronous onReset path so the spring runs to
+  // settle instead of being short-circuited.
+  private commitAnimating = false;
+
   private dataShareHelper: data_dataShare.DataShareHelper | null = null;
   private navMode: string = '1';
 
@@ -117,8 +128,14 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     } catch (err) {
       Log.showError(TAG, `getDefaultDisplaySync failed: ${JSON.stringify(err)}`);
     }
+    this.dragController = new DragController({
+      vpToPx: this.vpToPx,
+      screenWidthPx: this.screenWidthPx,
+      screenHeightPx: this.screenHeightPx,
+    });
     this.recognizer = this.buildRecognizer();
     this.initDockWindow();
+    this.initDragWindow();
     this.initNavModeSubscription();
   }
 
@@ -133,6 +150,13 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       });
       this.dockWindow = null;
     }
+    if (this.dragWindow) {
+      this.dragWindow.destroyWindow().catch((e) => {
+        Log.showWarn(TAG, `destroy drag failed: ${JSON.stringify(e)}`);
+      });
+      this.dragWindow = null;
+    }
+    this.snapshotCapture.clear();
   }
 
   onRequest(_want, startId): void {
@@ -157,21 +181,36 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       motionPause: DEFAULT_MOTION_PAUSE_CONFIG,
     };
     return new SwipeRecognizer(cfg, {
-      onTrackingStart: () => {
+      onTrackingStart: (_sx: number, _sy: number) => {
         Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
         this.showDock();
+        this.dragController?.start();
+        this.showDragOverlay();
+        // Best-effort capture. Overlay is already up at scale=1 so
+        // when the PixelMap arrives the @StorageLink swaps it in.
+        this.snapshotCapture.capture(this.screenWidthPx, this.screenHeightPx);
       },
-      onProgress: (deltaVp: number, mode: ProgressMode) => {
+      onProgress: (deltaVp: number, mode: ProgressMode, lastX: number, lastY: number) => {
         if (!this.dockShown) this.showDock();
         const progress = Math.min(deltaVp / MIN_DELTA_RECENTS_VP, 1);
         AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, progress);
         AppStorage.SetOrCreate(APP_KEY_DOCK_MODE, mode);
+        this.dragController?.onProgress(deltaVp, lastX, lastY);
       },
       onCommit: (target: GestureEndTarget, info: CommitInfo) => {
         this.handleCommit(target, info);
       },
       onReset: () => {
+        // If commitAnimating, the spring is mid-flight and will
+        // tear down the overlay itself in its onComplete. We still
+        // hide the dock (it's the pre-commit hint, not part of the
+        // commit) but leave the drag overlay alone.
         this.hideDock();
+        if (!this.commitAnimating) {
+          this.dragController?.reset();
+          this.hideDragOverlay();
+          this.snapshotCapture.clear();
+        }
       },
     });
   }
@@ -307,12 +346,32 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       `vVp/ms=${info.endVelocityVpPerMs.toFixed(3)} paused=${info.paused} ` +
       `elapsed=${info.elapsedMs.toFixed(0)}ms` +
       (info.rejection ? ` rejection=${info.rejection}` : ''));
+    // If the drag overlay never came up (gesture rejected pre-slop,
+    // or capture+show never raced in), there's nothing to spring —
+    // just do the structural commit immediately.
+    if (!this.dragShown || !this.dragController) {
+      this.runStructuralCommit(target);
+      return;
+    }
+    this.commitAnimating = true;
+    this.dragController.commit(target, () => {
+      this.runStructuralCommit(target);
+      // Tear down after the structural commit so the system has the
+      // ability already started by the time the overlay disappears.
+      this.dragController?.reset();
+      this.hideDragOverlay();
+      this.snapshotCapture.clear();
+      this.commitAnimating = false;
+    });
+  }
+
+  private runStructuralCommit(target: GestureEndTarget): void {
     if (target === GestureEndTarget.HOME) {
       this.goHome();
     } else if (target === GestureEndTarget.RECENTS) {
       this.openRecents();
     }
-    // CANCEL: nothing to do; onReset will hide the dock.
+    // CANCEL: no structural action.
   }
 
   private goHome(): void {
@@ -434,6 +493,56 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, false);
     AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, 0);
     this.dockShown = false;
+  }
+
+  private initDragWindow(): void {
+    // TYPE_VOLUME_OVERLAY + setWindowTouchable(false) lets the overlay
+    // float above the foreground app without intercepting touches —
+    // the recognizer keeps reading them off inputMonitor.
+    const cfg: window.Configuration = {
+      name: 'OniroDragOverlay',
+      windowType: window.WindowType.TYPE_VOLUME_OVERLAY,
+      ctx: this.context,
+    };
+    window.createWindow(cfg).then((win) => {
+      this.dragWindow = win;
+      win.resize(this.screenWidthPx, this.screenHeightPx).catch((e) => {
+        Log.showWarn(TAG, `drag resize failed: ${JSON.stringify(e)}`);
+      });
+      win.moveWindowTo(0, 0).catch((e) => {
+        Log.showWarn(TAG, `drag move failed: ${JSON.stringify(e)}`);
+      });
+      win.setUIContent('pages/DragOverlay').then(() => {
+        win.setWindowBackgroundColor('#00000000');
+        win.setWindowFocusable(false).catch((e) => {
+          Log.showWarn(TAG, `drag setFocusable failed: ${JSON.stringify(e)}`);
+        });
+        win.setWindowTouchable(false).catch((e) => {
+          Log.showWarn(TAG, `drag setTouchable failed: ${JSON.stringify(e)}`);
+        });
+        Log.showInfo(TAG, 'drag window content set');
+      }).catch((e) => {
+        Log.showError(TAG, `drag setUIContent failed: ${JSON.stringify(e)}`);
+      });
+    }).catch((e) => {
+      Log.showError(TAG, `createWindow(drag) failed: ${JSON.stringify(e)}`);
+    });
+  }
+
+  private showDragOverlay(): void {
+    if (this.dragShown || !this.dragWindow) return;
+    this.dragShown = true;
+    this.dragWindow.showWindow().catch((e) => {
+      Log.showWarn(TAG, `drag show failed: ${JSON.stringify(e)}`);
+    });
+  }
+
+  private hideDragOverlay(): void {
+    if (!this.dragShown || !this.dragWindow) return;
+    this.dragShown = false;
+    this.dragWindow.hide().catch((e) => {
+      Log.showWarn(TAG, `drag hide failed: ${JSON.stringify(e)}`);
+    });
   }
 }
 
