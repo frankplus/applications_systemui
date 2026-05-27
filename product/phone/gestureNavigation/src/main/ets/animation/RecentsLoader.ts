@@ -81,9 +81,13 @@ export class RecentsLoader {
           snap,
         };
       }));
-      this.cached = snaps;
-      AppStorage.SetOrCreate(APP_KEY_DRAG_RECENTS, snaps);
-      Log.showInfo(TAG, `loaded ${snaps.length} recents in ${Date.now() - t0} ms`);
+      // Row layout convention: oldest leftmost → most-recent-BG
+      // closest to the foreground card (which is appended on the
+      // right by DragOverlay). So reverse the MRU-sorted result.
+      const ordered = snaps.slice().reverse();
+      this.cached = ordered;
+      AppStorage.SetOrCreate(APP_KEY_DRAG_RECENTS, ordered);
+      Log.showInfo(TAG, `loaded ${ordered.length} recents in ${Date.now() - t0} ms`);
     } catch (e) {
       Log.showWarn(TAG, `load failed: ${JSON.stringify(e)}`);
       AppStorage.SetOrCreate(APP_KEY_DRAG_RECENTS, [] as RecentsCardData[]);

@@ -14,15 +14,23 @@
  * On RECENTS commit, the controller springs the Row to the Overview
  * pose (foreground card centered, scale 0.65, recents visible). The
  * service then flips the window touchable/focusable so the user can
- * tap a card to activate, or tap the backdrop / foreground card to
- * return to the current app. Both paths dismiss the overlay.
+ * tap a card to activate, tap the backdrop / foreground card to
+ * return to the current app, or PAN HORIZONTALLY to bring older
+ * recents into the centered slot (snap-to-card on release).
  *
  *   Stack (bottom → top):
  *     1. Black fill                 (fallback if wallpaper missing)
  *     2. Wallpaper Image            (PixelMap from @ohos.wallpaper)
  *     3. Dim Column                 (alpha = backdropAlpha * 0.4)
  *     4. Backdrop tap-zone          (only in recents-mode)
- *     5. The Row of cards           (transformed)
+ *     5. Row of cards (wrapped)     (transformed; wrapper handles pan)
+ *
+ * The Row sits inside a wrapper Column that owns the pan-driven
+ * horizontal translate. The Row itself keeps its springMotion
+ * .animation() for the commit-spring, but the wrapper has no
+ * .animation() so finger-tracking during pan is instant; the
+ * snap-on-release uses an explicit animateTo() with a short EaseOut
+ * so the lag-free pan doesn't fight the snap.
  */
 
 import curves from '@ohos.curves';
@@ -42,7 +50,7 @@ interface RecentsCardData {
 @Component
 struct DragOverlay {
   // Visibility + content.
-  @StorageLink('OniroDragVisible') visible: boolean = false;
+  @StorageLink('OniroDragVisible') @Watch('onVisibleChange') visible: boolean = false;
   @StorageLink('OniroDragSnap') snap: image.PixelMap | null = null;
   @StorageLink('OniroDragWallpaper') wallpaper: image.PixelMap | null = null;
   @StorageLink('OniroDragRecents') recents: RecentsCardData[] = [];
@@ -62,9 +70,30 @@ struct DragOverlay {
   @StorageLink('OniroDragRecentsAlpha') recentsAl: number = 0;
   @StorageLink('OniroDragRadius') rad: number = 0;
   @StorageLink('OniroDragBackdropAlpha') backdropAlpha: number = 0;
-  @StorageLink('OniroDragRecentsMode') recentsMode: boolean = false;
+  @StorageLink('OniroDragRecentsMode') @Watch('onRecentsModeChange') recentsMode: boolean = false;
+
+  // Pan-scroll state. Local @State so the wrapper Column's translate
+  // updates without going through AppStorage (which would induce a
+  // spring lag we don't want during direct manipulation).
+  @State scrollOffsetVp: number = 0;
+  @State panStartOffset: number = 0;
 
   private readonly maxDim: number = 0.4;
+
+  onRecentsModeChange(): void {
+    // Entering recents-mode (after the commit spring settles) → start
+    // with the foreground card centered. Leaving it → just reset so
+    // the next gesture's mode-flip starts clean.
+    this.scrollOffsetVp = 0;
+    this.panStartOffset = 0;
+  }
+
+  onVisibleChange(): void {
+    if (!this.visible) {
+      this.scrollOffsetVp = 0;
+      this.panStartOffset = 0;
+    }
+  }
 
   private dismissOverlay(): void {
     console.log(`${TAG} dismissOverlay`);
@@ -103,6 +132,19 @@ struct DragOverlay {
       });
   }
 
+  // Card width on screen (post-scale) + spacing between adjacent
+  // cards. One "step" advances the row by exactly one card slot.
+  private cardStepVp(): number {
+    return (this.cardWidthVp + this.spacingVp) * this.sc;
+  }
+
+  // Maximum positive offset = bring the oldest recent to center.
+  // Negative offsets are clamped to zero (foreground is already at
+  // the right end of the row; there's no card to the right of it).
+  private maxScrollVp(): number {
+    return this.recents.length * this.cardStepVp();
+  }
+
   build() {
     Stack() {
       // 1. Black backdrop fill — only fallback if wallpaper missing.
@@ -134,69 +176,117 @@ struct DragOverlay {
           .onClick(() => this.dismissOverlay());
       }
 
-      // 5. The Row of cards.
+      // 5. The Row of cards, wrapped so the pan-driven horizontal
+      // translate is applied OUTSIDE the .animation() boundary —
+      // otherwise the spring catches up to the finger lazily and
+      // direct manipulation feels mushy.
       if (this.visible && this.snap) {
-        Row({ space: this.spacingVp }) {
-          // Background recents on the left.
-          ForEach(this.recents, (m: RecentsCardData) => {
-            Stack({ alignContent: Alignment.TopEnd }) {
-              if (m.snap) {
-                Image(m.snap)
-                  .width(this.cardWidthVp)
-                  .height(this.cardHeightVp)
-                  .borderRadius(this.rad)
-                  .clip(true)
-                  .objectFit(ImageFit.Cover)
-                  .onClick(() => {
-                    if (this.recentsMode) this.activateMission(m.missionId);
-                  });
-              } else {
-                Column()
-                  .width(this.cardWidthVp)
-                  .height(this.cardHeightVp)
-                  .borderRadius(this.rad)
-                  .backgroundColor('#444444');
+        Column() {
+          Row({ space: this.spacingVp }) {
+            // Background recents on the left. RecentsLoader returns
+            // them in oldest→newest order so the rightmost recent is
+            // adjacent to the foreground card.
+            ForEach(this.recents, (m: RecentsCardData) => {
+              Stack({ alignContent: Alignment.TopEnd }) {
+                if (m.snap) {
+                  Image(m.snap)
+                    .width(this.cardWidthVp)
+                    .height(this.cardHeightVp)
+                    .borderRadius(this.rad)
+                    .clip(true)
+                    .objectFit(ImageFit.Cover)
+                    .onClick(() => {
+                      if (this.recentsMode) this.activateMission(m.missionId);
+                    });
+                } else {
+                  Column()
+                    .width(this.cardWidthVp)
+                    .height(this.cardHeightVp)
+                    .borderRadius(this.rad)
+                    .backgroundColor('#444444');
+                }
+                if (this.recentsMode) {
+                  Text('×')
+                    .fontSize(28).fontColor(Color.White).fontWeight(FontWeight.Bold)
+                    .textAlign(TextAlign.Center)
+                    .width(40).height(40).borderRadius(20)
+                    .backgroundColor('#88000000')
+                    .margin({ top: 16, right: 16 })
+                    .onClick(() => this.clearMission(m.missionId));
+                }
               }
-              if (this.recentsMode) {
-                Text('×')
-                  .fontSize(28).fontColor(Color.White).fontWeight(FontWeight.Bold)
-                  .textAlign(TextAlign.Center)
-                  .width(40).height(40).borderRadius(20)
-                  .backgroundColor('#88000000')
-                  .margin({ top: 16, right: 16 })
-                  .onClick(() => this.clearMission(m.missionId));
-              }
-            }
-            .width(this.cardWidthVp)
-            .height(this.cardHeightVp)
-            .opacity(this.recentsAl);
-          }, (m: RecentsCardData) => `${m.missionId}`)
+              .width(this.cardWidthVp)
+              .height(this.cardHeightVp)
+              .opacity(this.recentsAl);
+            }, (m: RecentsCardData) => `${m.missionId}`)
 
-          // Foreground (captured snapshot) — rightmost, always opaque
-          // during drag; tap (in recents mode only) dismisses.
-          Image(this.snap)
-            .width(this.cardWidthVp)
-            .height(this.cardHeightVp)
-            .borderRadius(this.rad)
-            .clip(true)
-            .objectFit(ImageFit.Cover)
-            .opacity(this.al)
-            .onClick(() => {
-              if (this.recentsMode) this.dismissOverlay();
-            });
+            // Foreground (captured snapshot) — rightmost, always
+            // opaque during drag; tap (in recents mode only)
+            // dismisses back to the original foreground app.
+            Image(this.snap)
+              .width(this.cardWidthVp)
+              .height(this.cardHeightVp)
+              .borderRadius(this.rad)
+              .clip(true)
+              .objectFit(ImageFit.Cover)
+              .opacity(this.al)
+              .onClick(() => {
+                if (this.recentsMode) this.dismissOverlay();
+              });
+          }
+          .width(this.rowWidthVp)
+          .height(this.rowHeightVp)
+          .position({ x: this.rowLeftVp, y: this.rowTopVp })
+          .scale({
+            x: this.sc,
+            y: this.sc,
+            centerX: this.anchorXVp,
+            centerY: this.anchorYVp,
+          })
+          .animation({ curve: curves.springMotion(0.34, 0.82) });
         }
-        .width(this.rowWidthVp)
-        .height(this.rowHeightVp)
-        .position({ x: this.rowLeftVp, y: this.rowTopVp })
-        .scale({
-          x: this.sc,
-          y: this.sc,
-          centerX: this.anchorXVp,
-          centerY: this.anchorYVp,
-        })
-        .animation({ curve: curves.springMotion(0.34, 0.82) });
+        .width('100%').height('100%')
+        .translate({ x: this.scrollOffsetVp, y: 0 });
       }
     }
-    .width('100%').height('100%');
+    .width('100%').height('100%')
+    .gesture(
+      // Horizontal pan to scroll through recents in Overview mode.
+      // Distance 8vp filters out taps and tiny jitter; tap handlers
+      // on cards/backdrop still fire because they need zero motion.
+      // Inactive outside recents mode (touchable=false during drag,
+      // and we also gate on recentsMode for safety).
+      PanGesture({ direction: PanDirection.Horizontal, distance: 8 })
+        .onActionStart((_e: GestureEvent) => {
+          if (!this.recentsMode) return;
+          this.panStartOffset = this.scrollOffsetVp;
+        })
+        .onActionUpdate((e: GestureEvent) => {
+          if (!this.recentsMode) return;
+          const max = this.maxScrollVp();
+          const target = Math.max(0, Math.min(max, this.panStartOffset + e.offsetX));
+          this.scrollOffsetVp = target;
+        })
+        .onActionEnd((_e: GestureEvent) => {
+          if (!this.recentsMode) return;
+          const step = this.cardStepVp();
+          const max = this.maxScrollVp();
+          const snapIdx = step > 0 ? Math.round(this.scrollOffsetVp / step) : 0;
+          const clamped = Math.max(0, Math.min(this.recents.length, snapIdx));
+          const snapTo = Math.max(0, Math.min(max, clamped * step));
+          animateTo({ duration: 240, curve: Curve.EaseOut }, () => {
+            this.scrollOffsetVp = snapTo;
+          });
+        })
+        .onActionCancel(() => {
+          if (!this.recentsMode) return;
+          const step = this.cardStepVp();
+          const snapIdx = step > 0 ? Math.round(this.scrollOffsetVp / step) : 0;
+          const snapTo = Math.max(0, Math.min(this.recents.length, snapIdx)) * step;
+          animateTo({ duration: 240, curve: Curve.EaseOut }, () => {
+            this.scrollOffsetVp = snapTo;
+          });
+        })
+    );
   }
 }
