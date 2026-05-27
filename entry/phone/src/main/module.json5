@@ -112,6 +112,15 @@
       },
       {
         "name": "ohos.permission.CONNECTIVITY_INTERNAL"
+      },
+      {
+        "name": "ohos.permission.INPUT_MONITORING"
+      },
+      {
+        "name": "ohos.permission.MANAGE_MISSIONS"
+      },
+      {
+        "name": "ohos.permission.SYSTEM_FLOAT_WINDOW"
       }
     ]
   }

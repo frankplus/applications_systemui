@@ -1,0 +1,11 @@
+{
+  "entryModules": [
+    "phone_entry",
+  ],
+  "apiType": 'stageMode',
+    "targets": [
+    {
+      "name": "default",
+    }
+  ]
+}

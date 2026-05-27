@@ -125,6 +125,15 @@
       ]
     },
     {
+      "name": "phone_gestureNavigation",
+      "srcPath": "./product/phone/gestureNavigation",
+      "targets": [
+        {
+          "name": "default"
+        }
+      ]
+    },
+    {
       "name": "common",
       "srcPath": "./common",
       "targets": [

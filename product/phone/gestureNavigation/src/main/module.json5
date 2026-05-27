@@ -1,0 +1,33 @@
+{
+  "module": {
+    "name": "phone_gestureNavigation",
+    "type": "feature",
+    "srcEntrance": "./ets/Application/AbilityStage.ts",
+    "description": "$string:mainability_description",
+    "mainElement": "com.ohos.systemui.gesturenavigation.ServiceExtAbility",
+    "deviceTypes": [
+      "default"
+    ],
+    "metadata": [
+      {
+        "name": "ArkTSPartialUpdate",
+        "value": "true"
+      }
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "uiSyntax": "ets",
+    "pages": "$profile:main_pages",
+    "extensionAbilities": [
+      {
+        "visible": true,
+        "srcEntrance": "./ets/ServiceExtAbility/ServiceExtAbility.ts",
+        "name": "com.ohos.systemui.gesturenavigation.ServiceExtAbility",
+        "icon": "$media:icon",
+        "description": "$string:mainability_description",
+        "label": "$string:app_name",
+        "type": "service"
+      }
+    ]
+  }
+}

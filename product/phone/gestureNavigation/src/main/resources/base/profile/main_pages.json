@@ -1,0 +1,6 @@
+{
+  "src": [
+    "pages/GestureDock",
+    "pages/RecentsOverlay"
+  ]
+}

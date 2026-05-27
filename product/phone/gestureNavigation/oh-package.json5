@@ -1,0 +1,9 @@
+{
+  "devDependencies": {},
+  "name": "phone_gestureNavigation",
+  "description": "Bottom-edge gesture navigation (home / recents)",
+  "version": "1.0.0",
+  "dependencies": {
+    "@ohos/common": "file:../../../common"
+  }
+}
