@@ -8,8 +8,9 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Bottom-edge gesture-navigation host. Owns the dock peek-in window and
- * the OniroRecentsOverlay window; delegates all swipe recognition to
- * SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
+ * the OniroDragOverlay window (which doubles as the Quickstep-style
+ * Overview surface on RECENTS commit); delegates all swipe recognition
+ * to SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
  *
  * Quickstep parity work lives in ./recognizer/ — this file only wires
  * inputMonitor events into the recognizer and translates its callbacks
@@ -35,6 +36,7 @@ import { DEFAULT_MOTION_PAUSE_CONFIG } from '../recognizer/MotionPauseDetector';
 import { SnapshotCapture } from '../animation/SnapshotCapture';
 import { DragController } from '../animation/DragController';
 import { WallpaperCache } from '../animation/WallpaperCache';
+import { RecentsLoader } from '../animation/RecentsLoader';
 
 const TAG = 'GestureNavigation_ServiceExtAbility';
 
@@ -111,10 +113,18 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private snapshotCapture: SnapshotCapture = new SnapshotCapture();
   private dragController: DragController | null = null;
   private wallpaperCache: WallpaperCache = new WallpaperCache();
+  private recentsLoader: RecentsLoader = new RecentsLoader();
   // True from onCommit until the post-spring teardown completes —
   // suppresses the synchronous onReset path so the spring runs to
   // settle instead of being short-circuited.
   private commitAnimating = false;
+  // True from the moment a RECENTS commit's spring settles until the
+  // user taps somewhere (recents card / foreground card / backdrop) —
+  // the drag overlay is "live" as the Overview surface. We poll the
+  // OniroDragVisible flag (DragOverlay flips it on dismiss) to spot
+  // the transition back to idle so we can revert the window to
+  // non-touchable for the next gesture.
+  private inRecentsMode = false;
 
   private dataShareHelper: data_dataShare.DataShareHelper | null = null;
   private navMode: string = '1';
@@ -142,6 +152,30 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     this.initDockWindow();
     this.initDragWindow();
     this.initNavModeSubscription();
+  }
+
+  /**
+   * Called at the start of every gesture (slop crossed). If the
+   * previous gesture's RECENTS-commit overlay is still up — either
+   * because the user is re-swiping without dismissing, or because
+   * they've already tapped a card and we just haven't completed the
+   * dismiss cleanup yet — drive it to clean state before the new
+   * gesture proceeds. Flips the window back to non-touchable so the
+   * recogniser keeps receiving raw touch events (inputMonitor sees
+   * them either way, but a touchable=true overlay would also let
+   * stray onClick handlers fire).
+   */
+  private resetOverlayForGesture(): void {
+    if (this.dragWindow && (this.inRecentsMode || this.dragShown)) {
+      this.dragWindow.setWindowFocusable(false).catch((e) => {
+        Log.showWarn(TAG, `pre-gesture setFocusable failed: ${JSON.stringify(e)}`);
+      });
+      this.dragWindow.setWindowTouchable(false).catch((e) => {
+        Log.showWarn(TAG, `pre-gesture setTouchable failed: ${JSON.stringify(e)}`);
+      });
+    }
+    this.inRecentsMode = false;
+    this.dragShown = false;
   }
 
   onDestroy(): void {
@@ -188,8 +222,16 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     return new SwipeRecognizer(cfg, {
       onTrackingStart: (_sx: number, _sy: number) => {
         Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
+        this.resetOverlayForGesture();
         this.showDock();
         this.dragController?.start();
+        // Kick off the recents fetch IN PARALLEL with the snapshot
+        // — both can take 100-300 ms but the snapshot blocks the
+        // overlay-show. Once recents resolve, push the count into
+        // the controller so the row width / scale anchor refresh.
+        this.recentsLoader.load().then(() => {
+          this.dragController?.setRecentsCount(this.recentsLoader.count());
+        });
         // Show the overlay only after the snapshot is ready —
         // otherwise we'd briefly render an opaque-black backdrop
         // with no foreground content on top, which flashes through.
@@ -358,69 +400,89 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       `elapsed=${info.elapsedMs.toFixed(0)}ms` +
       (info.rejection ? ` rejection=${info.rejection}` : ''));
     // If the drag overlay never came up (gesture rejected pre-slop,
-    // or capture+show never raced in), there's nothing to spring —
-    // just do the structural commit immediately.
+    // or capture+show never raced in), there's no spring to run.
+    // HOME still needs the structural commit; RECENTS without an
+    // overlay is a no-op (would just open an empty Overview which
+    // is worse than doing nothing).
     if (!this.dragShown || !this.dragController) {
-      this.runStructuralCommit(target);
+      if (target === GestureEndTarget.HOME) {
+        this.goHome();
+      }
+      this.recentsLoader.clear();
       return;
     }
     this.commitAnimating = true;
-    // Kick off the structural commit in PARALLEL with the spring
-    // so the recents window (or the launcher) starts loading
-    // immediately — otherwise the user releases their finger,
-    // sees the drag overlay vanish, and then waits ~1 s for the
-    // recents page to render before anything happens.
-    this.runStructuralCommit(target);
     const teardown = (): void => {
       this.dragController?.reset();
       this.hideDragOverlay();
       this.snapshotCapture.clear();
+      this.recentsLoader.clear();
       this.commitAnimating = false;
     };
     this.dragController.commit(target, () => {
-      // Spring is settled. For RECENTS the new window may still be
-      // loading — wait until it signals OniroRecentsOpen=true before
-      // tearing down so we don't expose the foreground in between.
-      // For HOME/CANCEL the spring's end state is invisible-ish
-      // (alpha 0 or snap-back to fullscreen) so immediate teardown
-      // is fine.
+      // Spring settled. RECENTS keeps the overlay LIVE as the
+      // Overview surface (flip touchable+focusable + watch for
+      // user dismissal). HOME / CANCEL tear down immediately —
+      // HOME's structural commit fires here too, after the
+      // overlay has finished its dissolve-to-launcher spring.
       if (target === GestureEndTarget.RECENTS) {
-        this.teardownWhenRecentsReady(teardown);
+        this.enterRecentsMode();
       } else {
+        if (target === GestureEndTarget.HOME) {
+          this.goHome();
+        }
         teardown();
       }
     });
   }
 
-  // Polls AppStorage every 40 ms (negligible cost) until the
-  // recents overlay signals it's on-screen, then runs `teardown`.
-  // 1500 ms cap so a missed signal still tears the drag down.
-  private teardownWhenRecentsReady(teardown: () => void): void {
-    const start = Date.now();
-    const maxWaitMs = 1500;
-    const check = (): void => {
-      const open = AppStorage.Get<boolean>('OniroRecentsOpen');
-      if (open === true) {
-        teardown();
-        return;
-      }
-      if (Date.now() - start > maxWaitMs) {
-        Log.showWarn(TAG, 'recents-ready timeout — tearing drag down anyway');
-        teardown();
-        return;
-      }
-      setTimeout(check, 40);
-    };
-    check();
+  /**
+   * Spring has settled in the Overview pose. Flip the drag window
+   * touchable + focusable so the user can interact with the cards,
+   * and start polling for the dismiss signal (DragOverlay sets
+   * OniroDragVisible=false when the user taps anywhere).
+   */
+  private enterRecentsMode(): void {
+    Log.showInfo(TAG, 'enterRecentsMode');
+    this.inRecentsMode = true;
+    this.commitAnimating = false;
+    if (this.dragWindow) {
+      this.dragWindow.setWindowFocusable(true).catch((e) => {
+        Log.showWarn(TAG, `recents setFocusable failed: ${JSON.stringify(e)}`);
+      });
+      this.dragWindow.setWindowTouchable(true).catch((e) => {
+        Log.showWarn(TAG, `recents setTouchable failed: ${JSON.stringify(e)}`);
+      });
+    }
+    this.pollForOverlayDismiss();
   }
 
-  private runStructuralCommit(target: GestureEndTarget): void {
-    if (target === GestureEndTarget.HOME) {
-      this.goHome();
-    } else if (target === GestureEndTarget.RECENTS) {
-      this.openRecents();
-    }
-    // CANCEL: no structural action.
+  /**
+   * Poll OniroDragVisible every 80 ms while in recents mode. Once
+   * the overlay flips it to false (any tap inside DragOverlay), tear
+   * down: revert window touchable, release the snapshot + recents
+   * PixelMaps, and clear any controller state.
+   */
+  private pollForOverlayDismiss(): void {
+    const check = (): void => {
+      if (!this.inRecentsMode) return;
+      const visible = AppStorage.Get<boolean>('OniroDragVisible');
+      if (visible === false) {
+        Log.showInfo(TAG, 'overlay dismissed by user — cleaning up');
+        if (this.dragWindow) {
+          this.dragWindow.setWindowFocusable(false).catch(() => {});
+          this.dragWindow.setWindowTouchable(false).catch(() => {});
+        }
+        this.dragShown = false;
+        this.inRecentsMode = false;
+        this.dragController?.reset();
+        this.snapshotCapture.clear();
+        this.recentsLoader.clear();
+        return;
+      }
+      setTimeout(check, 80);
+    };
+    setTimeout(check, 80);
   }
 
   private goHome(): void {
@@ -432,27 +494,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       });
     } catch (err) {
       Log.showError(TAG, `goHome failed: ${JSON.stringify(err)}`);
-    }
-  }
-
-  private openRecents(): void {
-    Log.showInfo(TAG, 'openRecents');
-    // Reset the readiness flag — teardownWhenRecentsReady polls
-    // this and will fire immediately if a stale `true` is left from
-    // the prior gesture's openRecents.
-    AppStorage.SetOrCreate('OniroRecentsOpen', false);
-    // Always recreate so the page's aboutToAppear re-runs and we fetch a
-    // fresh mission list. If a previous recents window is still around (the
-    // user may have re-swiped without dismissing), destroy it first.
-    try {
-      const existing = window.findWindow('OniroRecentsOverlay');
-      existing.destroyWindow().then(() => {
-        this.createRecentsWindow();
-      }).catch(() => {
-        this.createRecentsWindow();
-      });
-    } catch (_e) {
-      this.createRecentsWindow();
     }
   }
 
@@ -496,40 +537,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       });
     }).catch((e) => {
       Log.showError(TAG, `createWindow(dock) failed: ${JSON.stringify(e)}`);
-    });
-  }
-
-  private createRecentsWindow(): void {
-    // TYPE_VOLUME_OVERLAY (not TYPE_SYSTEM_TOAST) — toast windows aren't
-    // focusable, so onClick handlers on the backdrop / cards never fire and
-    // clicks bleed through to the app underneath. The same type is used by
-    // systemui's notification & volume panels, both of which need input.
-    const cfg: window.Configuration = {
-      name: 'OniroRecentsOverlay',
-      windowType: window.WindowType.TYPE_VOLUME_OVERLAY,
-      ctx: this.context,
-    };
-    window.createWindow(cfg).then((win) => {
-      win.resize(this.screenWidthPx, this.screenHeightPx).catch(() => {});
-      win.moveWindowTo(0, 0).catch(() => {});
-      win.setUIContent('pages/RecentsOverlay').then(() => {
-        win.setWindowBackgroundColor('#00000000');
-        win.setWindowFocusable(true).catch((e) => {
-          Log.showWarn(TAG, `recents setFocusable failed: ${JSON.stringify(e)}`);
-        });
-        win.setWindowTouchable(true).catch((e) => {
-          Log.showWarn(TAG, `recents setTouchable failed: ${JSON.stringify(e)}`);
-        });
-        win.showWindow().then(() => {
-          AppStorage.SetOrCreate('OniroRecentsOpen', true);
-        }).catch((e) => {
-          Log.showWarn(TAG, `recents show failed: ${JSON.stringify(e)}`);
-        });
-      }).catch((e) => {
-        Log.showError(TAG, `recents setUIContent failed: ${JSON.stringify(e)}`);
-      });
-    }).catch((e) => {
-      Log.showError(TAG, `createWindow(recents) failed: ${JSON.stringify(e)}`);
     });
   }
 
