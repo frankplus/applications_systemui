@@ -34,6 +34,7 @@ import {
 import { DEFAULT_MOTION_PAUSE_CONFIG } from '../recognizer/MotionPauseDetector';
 import { SnapshotCapture } from '../animation/SnapshotCapture';
 import { DragController } from '../animation/DragController';
+import { WallpaperCache } from '../animation/WallpaperCache';
 
 const TAG = 'GestureNavigation_ServiceExtAbility';
 
@@ -109,6 +110,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private dragShown = false;
   private snapshotCapture: SnapshotCapture = new SnapshotCapture();
   private dragController: DragController | null = null;
+  private wallpaperCache: WallpaperCache = new WallpaperCache();
   // True from onCommit until the post-spring teardown completes —
   // suppresses the synchronous onReset path so the spring runs to
   // settle instead of being short-circuited.
@@ -133,6 +135,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       screenWidthPx: this.screenWidthPx,
       screenHeightPx: this.screenHeightPx,
     });
+    // Wallpaper is best-effort. If the fetch fails the overlay still
+    // works with a solid-black backdrop.
+    this.wallpaperCache.load();
     this.recognizer = this.buildRecognizer();
     this.initDockWindow();
     this.initDragWindow();
@@ -360,15 +365,53 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       return;
     }
     this.commitAnimating = true;
-    this.dragController.commit(target, () => {
-      this.runStructuralCommit(target);
-      // Tear down after the structural commit so the system has the
-      // ability already started by the time the overlay disappears.
+    // Kick off the structural commit in PARALLEL with the spring
+    // so the recents window (or the launcher) starts loading
+    // immediately — otherwise the user releases their finger,
+    // sees the drag overlay vanish, and then waits ~1 s for the
+    // recents page to render before anything happens.
+    this.runStructuralCommit(target);
+    const teardown = (): void => {
       this.dragController?.reset();
       this.hideDragOverlay();
       this.snapshotCapture.clear();
       this.commitAnimating = false;
+    };
+    this.dragController.commit(target, () => {
+      // Spring is settled. For RECENTS the new window may still be
+      // loading — wait until it signals OniroRecentsOpen=true before
+      // tearing down so we don't expose the foreground in between.
+      // For HOME/CANCEL the spring's end state is invisible-ish
+      // (alpha 0 or snap-back to fullscreen) so immediate teardown
+      // is fine.
+      if (target === GestureEndTarget.RECENTS) {
+        this.teardownWhenRecentsReady(teardown);
+      } else {
+        teardown();
+      }
     });
+  }
+
+  // Polls AppStorage every 40 ms (negligible cost) until the
+  // recents overlay signals it's on-screen, then runs `teardown`.
+  // 1500 ms cap so a missed signal still tears the drag down.
+  private teardownWhenRecentsReady(teardown: () => void): void {
+    const start = Date.now();
+    const maxWaitMs = 1500;
+    const check = (): void => {
+      const open = AppStorage.Get<boolean>('OniroRecentsOpen');
+      if (open === true) {
+        teardown();
+        return;
+      }
+      if (Date.now() - start > maxWaitMs) {
+        Log.showWarn(TAG, 'recents-ready timeout — tearing drag down anyway');
+        teardown();
+        return;
+      }
+      setTimeout(check, 40);
+    };
+    check();
   }
 
   private runStructuralCommit(target: GestureEndTarget): void {
@@ -394,6 +437,10 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   private openRecents(): void {
     Log.showInfo(TAG, 'openRecents');
+    // Reset the readiness flag — teardownWhenRecentsReady polls
+    // this and will fire immediately if a stale `true` is left from
+    // the prior gesture's openRecents.
+    AppStorage.SetOrCreate('OniroRecentsOpen', false);
     // Always recreate so the page's aboutToAppear re-runs and we fetch a
     // fresh mission list. If a previous recents window is still around (the
     // user may have re-swiped without dismissing), destroy it first.

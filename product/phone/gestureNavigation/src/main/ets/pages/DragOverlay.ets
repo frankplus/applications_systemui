@@ -2,21 +2,20 @@
  * Copyright (c) 2026 Francesco Pham
  * Licensed under the Apache License, Version 2.0.
  *
- * Foreground-app drag overlay. Renders a half-res PixelMap snapshot
- * of the foreground display and transforms it per-frame from
- * AppStorage values that DragController writes. A semi-opaque dim
- * Column behind the snapshot masks the live foreground app so the
- * scaled snapshot doesn't double-render against its source.
+ * Foreground-app drag overlay. Stacks (bottom → top):
+ *   1. Wallpaper Image — AOSP-style spatial backdrop. Falls back to
+ *      solid black if WallpaperCache hasn't populated the AppStorage
+ *      key (e.g. permission denied at boot).
+ *   2. Dim Column — caps at 0.4 alpha for "darkened wallpaper",
+ *      driven by OniroDragBackdropAlpha so we can ramp it down at
+ *      CANCEL / HOME commit.
+ *   3. Snapshot Image — transformed per-frame from AppStorage
+ *      (translate/scale/opacity/cornerRadius), springMotion via the
+ *      `.animation()` modifier.
  *
- * `.animation()` modifiers wrap each transformed property: during
- * the active drag DragController writes values that match the
- * finger so the spring is essentially a no-op (target = current).
- * At commit, DragController writes the end-state values for the
- * spring to settle into (e.g. scale 0.12 + alpha 0 for HOME).
- *
- * Owning window is TYPE_VOLUME_OVERLAY with setWindowTouchable(false)
- * so touches pass through to the foreground app — the recognizer
- * keeps reading them off inputMonitor.
+ * The owning window is TYPE_VOLUME_OVERLAY + setWindowTouchable(false)
+ * so touches reach the foreground app underneath while the overlay
+ * is visible.
  */
 
 import { image } from '@kit.ImageKit';
@@ -27,6 +26,7 @@ import curves from '@ohos.curves';
 struct DragOverlay {
   @StorageLink('OniroDragVisible') visible: boolean = false;
   @StorageLink('OniroDragSnap') snap: image.PixelMap | null = null;
+  @StorageLink('OniroDragWallpaper') wallpaper: image.PixelMap | null = null;
   @StorageLink('OniroDragX') tx: number = 0;
   @StorageLink('OniroDragY') ty: number = 0;
   @StorageLink('OniroDragScale') sc: number = 1;
@@ -34,19 +34,35 @@ struct DragOverlay {
   @StorageLink('OniroDragRadius') rad: number = 0;
   @StorageLink('OniroDragBackdropAlpha') backdropAlpha: number = 0;
 
-  // Quickstep's RectFSpringAnim uses stiffness 380 + damping ratio
-  // 0.85; OHOS springMotion's (response, dampingFraction) signature
-  // maps to roughly response=0.34s, damping=0.82 for the same feel.
-  // Inlined at each .animation() site below — keeping a field of
-  // type ICurve trips a "type object" inference error at build.
+  // Maximum dim that sits on top of the wallpaper. AOSP Launcher3
+  // uses ~0.35-0.45 of black; 0.4 matches well at our density.
+  private readonly maxDim: number = 0.4;
 
   build() {
     Stack() {
+      // Wallpaper backdrop — always rendered while visible. If the
+      // PixelMap is still null (cache miss / permission denied),
+      // the Stack's parent black fills the space instead.
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Black);
+
+      if (this.visible && this.wallpaper) {
+        Image(this.wallpaper)
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover);
+      }
+
+      // Dim layer — 0.4 max, scales with backdropAlpha so CANCEL /
+      // HOME end-states can ramp it down before the structural
+      // commit takes over visually.
       Column()
         .width('100%')
         .height('100%')
         .backgroundColor(Color.Black)
-        .opacity(this.visible ? this.backdropAlpha : 0)
+        .opacity(this.visible ? this.backdropAlpha * this.maxDim : 0)
         .animation({ curve: curves.springMotion(0.34, 0.82) });
 
       if (this.visible && this.snap) {

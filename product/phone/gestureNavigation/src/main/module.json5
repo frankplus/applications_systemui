@@ -28,13 +28,17 @@
         "label": "$string:app_name",
         "type": "service",
         "permissions": [
-          "ohos.permission.CAPTURE_SCREEN"
+          "ohos.permission.CAPTURE_SCREEN",
+          "ohos.permission.GET_WALLPAPER"
         ]
       }
     ],
     "requestPermissions": [
       {
         "name": "ohos.permission.CAPTURE_SCREEN"
+      },
+      {
+        "name": "ohos.permission.GET_WALLPAPER"
       }
     ]
   }
