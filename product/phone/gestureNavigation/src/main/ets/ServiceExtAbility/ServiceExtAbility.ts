@@ -185,10 +185,16 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
         this.showDock();
         this.dragController?.start();
-        this.showDragOverlay();
-        // Best-effort capture. Overlay is already up at scale=1 so
-        // when the PixelMap arrives the @StorageLink swaps it in.
-        this.snapshotCapture.capture(this.screenWidthPx, this.screenHeightPx);
+        // Show the overlay only after the snapshot is ready —
+        // otherwise we'd briefly render an opaque-black backdrop
+        // with no foreground content on top, which flashes through.
+        // ~45 ms warm, ~700 ms first-call.
+        this.snapshotCapture.capture(this.screenWidthPx, this.screenHeightPx)
+          .then((elapsed) => {
+            if (elapsed < 0) return;          // capture failed
+            if (!this.recognizer?.isActive()) return; // gesture already over
+            this.showDragOverlay();
+          });
       },
       onProgress: (deltaVp: number, mode: ProgressMode, lastX: number, lastY: number) => {
         if (!this.dockShown) this.showDock();

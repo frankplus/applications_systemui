@@ -174,7 +174,10 @@ struct RecentsOverlay {
       }
     }
     .width('100%').height('100%')
-    .transition(TransitionEffect.move(TransitionEdge.BOTTOM)
-      .animation({ curve: curves.springMotion(0.34, 0.82) }));
+    // Fade-in only — no slide. When opened from a gesture, the
+    // DragOverlay is already springing into the recents-card
+    // position, and a slide-up from the bottom would fight that
+    // motion and read as a second, conflicting animation.
+    .transition(TransitionEffect.opacity(0).animation({ duration: 180 }));
   }
 }

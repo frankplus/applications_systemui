@@ -49,7 +49,10 @@ const MIN_SCALE = 0.45;
 const MAX_RADIUS_VP = 24;
 const ALPHA_HOLD_FRAC = 0.25;
 const ALPHA_FLOOR = 0.85;
-const MAX_BACKDROP_ALPHA = 0.55;
+// Backdrop is held at full opacity (1.0) once the overlay shows so
+// the live foreground app behind it isn't visible while the snapshot
+// shrinks. AOSP shows the wallpaper here; we use solid black until
+// a wallpaper-PixelMap source is wired up.
 const HORIZ_DAMPING = 0.35;
 const DRAG_LENGTH_FRACTION = 0.75;
 
@@ -89,7 +92,11 @@ export class DragController {
     AppStorage.SetOrCreate(APP_KEY_DRAG_SCALE, 1.0);
     AppStorage.SetOrCreate(APP_KEY_DRAG_ALPHA, 1.0);
     AppStorage.SetOrCreate(APP_KEY_DRAG_RADIUS, 0);
-    AppStorage.SetOrCreate(APP_KEY_DRAG_BACKDROP_ALPHA, 0);
+    // Backdrop opens at full opacity. While the snapshot is at
+    // scale=1 it hides the backdrop entirely; as the snapshot
+    // shrinks the backdrop becomes the visible "behind" — opaque
+    // black, not the live foreground app.
+    AppStorage.SetOrCreate(APP_KEY_DRAG_BACKDROP_ALPHA, 1.0);
     AppStorage.SetOrCreate(APP_KEY_DRAG_VISIBLE, true);
   }
 
@@ -113,14 +120,13 @@ export class DragController {
       ? 1.0
       : lerp(1.0, ALPHA_FLOOR, (progress - ALPHA_HOLD_FRAC) / (1 - ALPHA_HOLD_FRAC));
     const radius = lerp(0, MAX_RADIUS_VP, progress);
-    const backdropAlpha = lerp(0, MAX_BACKDROP_ALPHA, progress);
+    // Backdrop is held opaque from start() — no per-tick update.
 
     AppStorage.SetOrCreate(APP_KEY_DRAG_X, x);
     AppStorage.SetOrCreate(APP_KEY_DRAG_Y, y);
     AppStorage.SetOrCreate(APP_KEY_DRAG_SCALE, scale);
     AppStorage.SetOrCreate(APP_KEY_DRAG_ALPHA, alpha);
     AppStorage.SetOrCreate(APP_KEY_DRAG_RADIUS, radius);
-    AppStorage.SetOrCreate(APP_KEY_DRAG_BACKDROP_ALPHA, backdropAlpha);
 
     this.tickCount++;
     if (this.tickCount % 8 === 0) {
@@ -151,23 +157,23 @@ export class DragController {
     let endRadius = 0;
     let endBackdropAlpha = 0;
     if (target === GestureEndTarget.HOME) {
-      // Spring down to the launcher hot-seat region (centre, bottom
-      // 12 % of screen). End scale is tiny so the snapshot pops off
-      // into the icon row.
+      // App dissolves to nothing in the centre; backdrop fades to
+      // reveal the launcher that's about to be brought forward.
       endScale = 0.12;
       endAlpha = 0;
-      endY = this.screenHeightVp * 0.4;
+      endY = 0;
       endRadius = MAX_RADIUS_VP;
       endBackdropAlpha = 0;
     } else if (target === GestureEndTarget.RECENTS) {
-      // Spring to the recents-card slot (top third). Hold alpha so
-      // the snapshot dissolves smoothly into the corresponding card
-      // in OniroRecentsOverlay when it opens.
+      // App shrinks to a thumbnail-sized card in the centre and
+      // stays put with full opacity. The backdrop stays opaque so
+      // OniroRecentsOverlay can fade in over it without revealing
+      // the live foreground.
       endScale = 0.65;
       endAlpha = 1.0;
-      endY = -this.screenHeightVp * 0.10;
+      endY = 0;
       endRadius = MAX_RADIUS_VP;
-      endBackdropAlpha = MAX_BACKDROP_ALPHA;
+      endBackdropAlpha = 1.0;
     } else {
       // CANCEL → snap back to fullscreen with overshoot from spring.
       endScale = 1.0;
