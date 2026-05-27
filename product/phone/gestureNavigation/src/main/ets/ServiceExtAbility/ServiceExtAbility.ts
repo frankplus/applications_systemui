@@ -6,6 +6,14 @@
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Bottom-edge gesture-navigation host. Owns the dock peek-in window and
+ * the OniroRecentsOverlay window; delegates all swipe recognition to
+ * SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
+ *
+ * Quickstep parity work lives in ./recognizer/ — this file only wires
+ * inputMonitor events into the recognizer and translates its callbacks
+ * into window operations.
  */
 
 import ServiceExtension from '@ohos.app.ability.ServiceExtensionAbility';
@@ -16,19 +24,36 @@ import settings from '@ohos.settings';
 import data_dataShare from '@ohos.data.dataShare';
 import Log from '../../../../../../../common/src/main/ets/default/Log';
 import Constants from '../../../../../../../common/src/main/ets/default/Constants';
+import {
+  SwipeRecognizer,
+  GestureEndTarget,
+  RecognizerConfig,
+  CommitInfo,
+  ProgressMode,
+} from '../recognizer/SwipeRecognizer';
+import { DEFAULT_MOTION_PAUSE_CONFIG } from '../recognizer/MotionPauseDetector';
 
 const TAG = 'GestureNavigation_ServiceExtAbility';
 
-// Lifted from sceneboard_disasm/FINDINGS.md §C and harmony-port-work/PLAN.md §4.
-// HarmonyOS resolves these at runtime from StyleConstants; the disasm has only
-// the references, not the literals, so we use the documented starting values.
+// Hot-zone, dock, and commit thresholds. The values below come from two
+// sources:
+//   * HOT_ZONE_VP / dock geometry / 800 vp·s legacy fling: original
+//     reverse-engineered values from sceneboard_disasm/FINDINGS.md §C and
+//     harmony-port-work/PLAN.md §4 (HarmonyOS StyleConstants defaults).
+//   * TOUCH_SLOP_VP / FLING_VP_PER_MS / motion-pause band: AOSP Launcher3
+//     Quickstep dimens (motion_pause_detector_speed_slow = 0.15 dp/ms,
+//     quickstep_fling_threshold_speed = 0.5 dp/ms,
+//     motion_pause_detector_min_displacement_from_app = 36 dp).
 const HOT_ZONE_VP = 32;
-const MIN_DELTA_VP = 120;        // commit-home distance
-const HOLD_DELTA_VP = 200;       // commit-recents distance
-const MIN_VELOCITY_VP_PER_S = 800;
-const HOLD_MS = 250;             // held pull commits to recents
-const DOCK_SHOW_AFTER_VP = 16;   // dock peek-in distance; smaller than commit
-const DOCK_WIDTH_VP = 112;       // GESTURE_NAV_AI_BAR_WIDTH_DEFAULT
+const TOUCH_SLOP_VP = 12;            // 8 dp default × 1.414 quickstep nav-mode factor
+const DOCK_SHOW_AFTER_VP = 16;
+const MIN_DELTA_HOME_VP = 120;       // minimum drag to commit HOME on release
+const MIN_DELTA_RECENTS_VP = 200;    // minimum drag to commit RECENTS on release
+const FLING_VP_PER_MS = 0.5;         // upward fling above this commits HOME
+const OVERVIEW_MIN_DEGREES = 15;     // shallower strokes are rejected
+const HOLD_MS = 250;                 // legacy hold-to-recents timer
+const HOLD_DRIFT_VP = 24;
+const DOCK_WIDTH_VP = 112;
 const DOCK_HEIGHT_VP = 40;
 const DOCK_BOTTOM_INSET_VP = 12;
 
@@ -40,27 +65,6 @@ const NAV_MODE_URI =
 const APP_KEY_DOCK_VISIBLE = 'OniroDockVisible';
 const APP_KEY_DOCK_PROGRESS = 'OniroDockProgress';   // 0..1 toward HOLD_DELTA_VP
 const APP_KEY_DOCK_MODE = 'OniroDockMode';           // 'home' | 'recents'
-
-// Loosely mirrors SCBGestureNavBarViewModel's enums. We don't yet need the
-// full set of fail reasons; one CANCELED state is enough.
-enum RecognizeState {
-  IDLE = 0,
-  TRACKING = 1,
-  CANCELED = 2,
-  COMMITTING_HOME = 3,
-  COMMITTING_RECENTS = 4,
-}
-
-enum PanGestureType {
-  DEFAULT = 0,
-  GAME_OPERATE = 1,
-}
-
-enum ActionType {
-  NONE = 0,
-  HOME = 1,
-  RECENTS = 2,
-}
 
 // Touch action codes per @ohos.multimodalInput.touchEvent.Action
 const TOUCH_CANCEL = 0;
@@ -75,20 +79,21 @@ const MOUSE_BUTTON_DOWN = 2;
 const MOUSE_BUTTON_UP = 3;
 const MOUSE_BUTTON_LEFT = 0;
 
-interface Tracking {
-  startY: number;
-  startTimeUs: number;
-  lastY: number;
-  lastTimeUs: number;
-  source: 'touch' | 'mouse';
+// Mouse events don't carry a pointer ID. Use a synthetic one that can't
+// collide with any real touch pointer (touch IDs are small, starting at 0).
+const MOUSE_POINTER_ID = 1000;
+
+enum PanGestureType {
+  DEFAULT = 0,
+  GAME_OPERATE = 1,
 }
 
 class GestureNavigationServiceExtAbility extends ServiceExtension {
-  private state: RecognizeState = RecognizeState.IDLE;
-  private tracking: Tracking | null = null;
   private screenHeightPx = 0;
   private screenWidthPx = 0;
   private vpToPx = 1;
+
+  private recognizer: SwipeRecognizer | null = null;
 
   private touchReceiver = (ev) => this.handleTouch(ev);
   private mouseReceiver = (ev) => this.handleMouse(ev);
@@ -97,7 +102,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   private dockWindow: window.Window | null = null;
   private dockShown = false;
-  private holdTimerId: number | null = null;
 
   private dataShareHelper: data_dataShare.DataShareHelper | null = null;
   private navMode: string = '1';
@@ -113,6 +117,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     } catch (err) {
       Log.showError(TAG, `getDefaultDisplaySync failed: ${JSON.stringify(err)}`);
     }
+    this.recognizer = this.buildRecognizer();
     this.initDockWindow();
     this.initNavModeSubscription();
   }
@@ -132,6 +137,43 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   onRequest(_want, startId): void {
     Log.showInfo(TAG, `onRequest startId=${startId}`);
+  }
+
+  // ---- Recognizer wiring ------------------------------------------------
+
+  private buildRecognizer(): SwipeRecognizer {
+    const cfg: RecognizerConfig = {
+      vpToPx: this.vpToPx,
+      screenHeightPx: this.screenHeightPx,
+      hotZoneVp: HOT_ZONE_VP,
+      touchSlopVp: TOUCH_SLOP_VP,
+      dockShowAfterVp: DOCK_SHOW_AFTER_VP,
+      minDeltaHomeVp: MIN_DELTA_HOME_VP,
+      minDeltaRecentsVp: MIN_DELTA_RECENTS_VP,
+      flingVpPerMs: FLING_VP_PER_MS,
+      overviewMinDegrees: OVERVIEW_MIN_DEGREES,
+      holdMs: HOLD_MS,
+      holdDriftVp: HOLD_DRIFT_VP,
+      motionPause: DEFAULT_MOTION_PAUSE_CONFIG,
+    };
+    return new SwipeRecognizer(cfg, {
+      onTrackingStart: () => {
+        Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
+        this.showDock();
+      },
+      onProgress: (deltaVp: number, mode: ProgressMode) => {
+        if (!this.dockShown) this.showDock();
+        const progress = Math.min(deltaVp / MIN_DELTA_RECENTS_VP, 1);
+        AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, progress);
+        AppStorage.SetOrCreate(APP_KEY_DOCK_MODE, mode);
+      },
+      onCommit: (target: GestureEndTarget, info: CommitInfo) => {
+        this.handleCommit(target, info);
+      },
+      onReset: () => {
+        this.hideDock();
+      },
+    });
   }
 
   // ---- Nav-mode subscription -------------------------------------------
@@ -197,173 +239,81 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }
     Log.showInfo(TAG, 'inputMonitor unregistered');
     this.monitorActive = false;
-    this.tracking = null;
-    this.state = RecognizeState.IDLE;
     this.mouseButtonDown = false;
-    this.clearHoldTimer();
+    // Recognizer is allowed to keep its state until natural end.
   }
 
-  // ---- Touch handling --------------------------------------------------
+  // ---- Touch / mouse handling -----------------------------------------
 
   private handleTouch(ev): boolean {
     const t = ev?.touch;
     if (!t) return false;
-    return this.dispatchPointer(ev.action, t.screenY, ev.actionTime, 'touch');
+    const id = (t.id ?? 0) | 0;
+    const x = t.screenX ?? 0;
+    const y = t.screenY ?? 0;
+    const timeMs = (ev.actionTime ?? 0) / 1000;
+    return this.dispatch(ev.action, id, x, y, timeMs);
   }
 
-  // Mouse drag mapped to a touch-like gesture: BUTTON_DOWN starts tracking,
-  // MOVE while button is held updates, BUTTON_UP / CANCEL ends.
+  // Mouse drag mapped to touch: BUTTON_DOWN starts a stroke, MOVE updates,
+  // BUTTON_UP / CANCEL ends. Only the left button qualifies.
   private handleMouse(ev): boolean {
     const action = ev?.action;
+    const x = ev?.screenX ?? 0;
     const y = ev?.screenY;
-    const t = ev?.actionTime;
+    const timeMs = (ev?.actionTime ?? 0) / 1000;
     if (action === undefined || y === undefined) return false;
     if (action === MOUSE_BUTTON_DOWN) {
       if ((ev.button ?? MOUSE_BUTTON_LEFT) !== MOUSE_BUTTON_LEFT) return false;
       this.mouseButtonDown = true;
-      return this.dispatchPointer(TOUCH_DOWN, y, t, 'mouse');
+      return this.dispatch(TOUCH_DOWN, MOUSE_POINTER_ID, x, y, timeMs);
     }
     if (action === MOUSE_MOVE && this.mouseButtonDown) {
-      return this.dispatchPointer(TOUCH_MOVE, y, t, 'mouse');
+      return this.dispatch(TOUCH_MOVE, MOUSE_POINTER_ID, x, y, timeMs);
     }
     if (action === MOUSE_BUTTON_UP || action === MOUSE_CANCEL) {
       if (!this.mouseButtonDown) return false;
       this.mouseButtonDown = false;
       const mapped = action === MOUSE_CANCEL ? TOUCH_CANCEL : TOUCH_UP;
-      return this.dispatchPointer(mapped, y, t, 'mouse');
+      return this.dispatch(mapped, MOUSE_POINTER_ID, x, y, timeMs);
     }
     return false;
   }
 
-  // ---- State machine ---------------------------------------------------
-
-  private dispatchPointer(action: number, y: number, timeUs: number, source: 'touch' | 'mouse'): boolean {
+  private dispatch(action: number, id: number, x: number, y: number, timeMs: number): boolean {
+    const r = this.recognizer;
+    if (!r) return false;
+    if (this.checkAndSetPerationType() === PanGestureType.GAME_OPERATE) return false;
     if (action === TOUCH_DOWN) {
-      return this.onPointerDown(y, timeUs, source);
+      const accepted = r.onPointerDown(id, x, y, timeMs);
+      return false; // never pilfer at DOWN — observation only.
     }
-    if (this.state !== RecognizeState.TRACKING || !this.tracking) return false;
-    // Lock to whichever pointer source claimed the gesture, in case both fire.
-    if (this.tracking.source !== source) return false;
     if (action === TOUCH_MOVE) {
-      return this.onPointerMove(y, timeUs);
+      r.onPointerMove(id, x, y, timeMs);
+      return false;
     }
     if (action === TOUCH_UP || action === TOUCH_CANCEL) {
-      return this.onPointerEnd(y, timeUs, action === TOUCH_CANCEL);
+      r.onPointerEnd(id, x, y, timeMs, action === TOUCH_CANCEL);
+      return false;
     }
     return false;
   }
 
-  private onPointerDown(y: number, timeUs: number, source: 'touch' | 'mouse'): boolean {
-    const hotZonePx = HOT_ZONE_VP * this.vpToPx;
-    if (this.screenHeightPx <= 0 || y < this.screenHeightPx - hotZonePx) {
-      return false;
-    }
-    const panType = this.checkAndSetPerationType();
-    if (panType === PanGestureType.GAME_OPERATE) {
-      return false;
-    }
-    this.tracking = {
-      startY: y,
-      startTimeUs: timeUs,
-      lastY: y,
-      lastTimeUs: timeUs,
-      source,
-    };
-    this.state = RecognizeState.TRACKING;
-    Log.showDebug(TAG, `DOWN(${source}) inside hot zone y=${y}`);
-    return false;
-  }
+  // ---- Commit dispatch -------------------------------------------------
 
-  private onPointerMove(y: number, timeUs: number): boolean {
-    if (!this.tracking) return false;
-    this.tracking.lastY = y;
-    this.tracking.lastTimeUs = timeUs;
-
-    const deltaPx = this.tracking.startY - y;
-    if (deltaPx <= 0) return false;
-    const deltaVp = deltaPx / this.vpToPx;
-
-    if (deltaVp >= DOCK_SHOW_AFTER_VP) {
-      this.showDock();
-      const progress = Math.min(deltaVp / HOLD_DELTA_VP, 1);
-      AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, progress);
-      AppStorage.SetOrCreate(APP_KEY_DOCK_MODE, deltaVp >= HOLD_DELTA_VP ? 'recents' : 'home');
-    }
-
-    if (deltaVp >= HOLD_DELTA_VP && this.holdTimerId === null) {
-      const armedAtY = y;
-      this.holdTimerId = setTimeout(() => {
-        this.holdTimerId = null;
-        if (!this.tracking) return;
-        const drift = Math.abs(this.tracking.lastY - armedAtY) / this.vpToPx;
-        if (drift < 24) {
-          this.commit(ActionType.RECENTS);
-        }
-      }, HOLD_MS);
-    }
-    return false;
-  }
-
-  private onPointerEnd(y: number, timeUs: number, canceled: boolean): boolean {
-    if (!this.tracking) {
-      this.state = RecognizeState.IDLE;
-      return false;
-    }
-    const startY = this.tracking.startY;
-    const startTimeUs = this.tracking.startTimeUs;
-    this.tracking = null;
-    this.clearHoldTimer();
-
-    if (canceled) {
-      this.state = RecognizeState.CANCELED;
-      this.hideDock();
-      this.state = RecognizeState.IDLE;
-      return false;
-    }
-
-    const deltaPx = startY - y;
-    if (deltaPx <= 0) {
-      this.hideDock();
-      this.state = RecognizeState.IDLE;
-      return false;
-    }
-    const deltaVp = deltaPx / this.vpToPx;
-    const elapsedMs = Math.max((timeUs - startTimeUs) / 1000, 1);
-    const velocityVpS = (deltaVp / elapsedMs) * 1000;
-
+  private handleCommit(target: GestureEndTarget, info: CommitInfo): void {
     Log.showInfo(TAG,
-      `UP deltaVp=${deltaVp.toFixed(1)} elapsedMs=${elapsedMs.toFixed(0)} vpS=${velocityVpS.toFixed(0)}`);
-
-    let action = ActionType.NONE;
-    if (deltaVp >= HOLD_DELTA_VP && elapsedMs >= HOLD_MS) {
-      action = ActionType.RECENTS;
-    } else if (deltaVp >= MIN_DELTA_VP && velocityVpS >= MIN_VELOCITY_VP_PER_S) {
-      action = ActionType.HOME;
-    }
-    this.commit(action);
-    return action !== ActionType.NONE;
-  }
-
-  private commit(action: ActionType): void {
-    if (action === ActionType.HOME) {
-      this.state = RecognizeState.COMMITTING_HOME;
+      `commit target=${GestureEndTarget[target]} deltaVp=${info.displacementVp.toFixed(1)} ` +
+      `vVp/ms=${info.endVelocityVpPerMs.toFixed(3)} paused=${info.paused} ` +
+      `elapsed=${info.elapsedMs.toFixed(0)}ms` +
+      (info.rejection ? ` rejection=${info.rejection}` : ''));
+    if (target === GestureEndTarget.HOME) {
       this.goHome();
-    } else if (action === ActionType.RECENTS) {
-      this.state = RecognizeState.COMMITTING_RECENTS;
+    } else if (target === GestureEndTarget.RECENTS) {
       this.openRecents();
     }
-    this.hideDock();
-    this.state = RecognizeState.IDLE;
+    // CANCEL: nothing to do; onReset will hide the dock.
   }
-
-  // Mirror of SCBGestureNavBarViewModel.checkAndSetPerationType: returns
-  // GAME_OPERATE for apps that opt out of nav gestures. Stub for now —
-  // hook point for future IME-active / game-mode / anti-touch rules.
-  private checkAndSetPerationType(): PanGestureType {
-    return PanGestureType.DEFAULT;
-  }
-
-  // ---- Action dispatch -------------------------------------------------
 
   private goHome(): void {
     Log.showInfo(TAG, 'goHome');
@@ -387,7 +337,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       existing.destroyWindow().then(() => {
         this.createRecentsWindow();
       }).catch(() => {
-        // Already gone — proceed.
         this.createRecentsWindow();
       });
     } catch (_e) {
@@ -395,7 +344,14 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }
   }
 
-  // ---- Dock window -----------------------------------------------------
+  // Mirror of SCBGestureNavBarViewModel.checkAndSetPerationType: returns
+  // GAME_OPERATE for apps that opt out of nav gestures. Stub for now —
+  // hook point for future IME-active / game-mode / anti-touch rules.
+  private checkAndSetPerationType(): PanGestureType {
+    return PanGestureType.DEFAULT;
+  }
+
+  // ---- Dock + recents window plumbing ---------------------------------
 
   private initDockWindow(): void {
     const widthPx = Math.round(DOCK_WIDTH_VP * this.vpToPx);
@@ -478,13 +434,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, false);
     AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, 0);
     this.dockShown = false;
-  }
-
-  private clearHoldTimer(): void {
-    if (this.holdTimerId !== null) {
-      clearTimeout(this.holdTimerId);
-      this.holdTimerId = null;
-    }
   }
 }
 
