@@ -143,7 +143,13 @@ export class DragController {
   /**
    * Called when the recognizer crosses slop. Reset all transform values
    * to a clean fullscreen baseline so the first onProgress sees a
-   * coherent starting state.
+   * coherent starting state. Does NOT flip OniroDragVisible — that's
+   * the caller's job after the snapshot capture resolves (see
+   * `show()`). Every visible layer in DragOverlay.ets is gated on
+   * `visible && snap`; flipping visible here would still cause a
+   * fullscreen flash during the 45–700 ms of capture latency, because
+   * the dim layer (40 % black) and other layers would all be live
+   * before the snapshot Image has a texture.
    */
   start(): void {
     this.tickCount = 0;
@@ -157,6 +163,15 @@ export class DragController {
     // Position the row so the foreground card fills the screen
     // exactly: bottom at screen-bottom, center at screen-middle.
     this.writePosition(this.screenWidthVp / 2, this.screenHeightVp);
+  }
+
+  /**
+   * Flip OniroDragVisible=true. Call AFTER the snapshot capture has
+   * resolved and written to OniroDragSnap, so every layer in
+   * DragOverlay.ets (all gated on `visible && snap`) appears in the
+   * same frame the snap Image has a texture.
+   */
+  show(): void {
     AppStorage.SetOrCreate(APP_KEY_DRAG_VISIBLE, true);
   }
 

@@ -157,8 +157,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       screenWidthPx: this.screenWidthPx,
       screenHeightPx: this.screenHeightPx,
     });
-    // Wallpaper is best-effort. If the fetch fails the overlay still
-    // works with a solid-black backdrop.
+    // Wallpaper is best-effort. If the fetch fails the wallpaper layer
+    // in DragOverlay.ets just doesn't paint (it's gated on the
+    // wallpaper PixelMap); the snap + dim + cards still render normally.
     this.wallpaperCache.load();
     this.recognizer = this.buildRecognizer();
     this.initDockWindow();
@@ -249,10 +250,13 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         this.recentsLoader.load().then(() => {
           this.dragController?.setRecentsCount(this.recentsLoader.count());
         });
-        // Show the overlay only after the snapshot is ready —
-        // otherwise we'd briefly render an opaque-black backdrop
-        // with no foreground content on top, which flashes through.
-        // ~45 ms warm, ~700 ms first-call.
+        // Show the overlay only after the snapshot is ready — every
+        // DragOverlay layer is gated on `visible && snap`, so flipping
+        // visible earlier (e.g. inside dragController.start) would
+        // still need a non-null snap to paint anything. Deferring the
+        // show to here also dodges a one-frame flash from layers that
+        // would otherwise be live while Image(snap)'s GPU texture is
+        // still uploading. Capture is ~45 ms warm, ~700 ms first-call.
         this.snapshotCapture.capture(this.screenWidthPx, this.screenHeightPx)
           .then((elapsed) => {
             if (elapsed < 0) return;          // capture failed
@@ -643,9 +647,14 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private showDragOverlay(): void {
     if (this.dragShown || !this.dragWindow) return;
     this.dragShown = true;
-    // Window is already shown (initDragWindow pre-shows). DragController
-    // toggles OniroDragVisible, which drives every visible layer in
-    // DragOverlay.ets — no `showWindow()` call on the gesture path.
+    // Window is already shown (initDragWindow pre-shows). Flip
+    // OniroDragVisible NOW (not in dragController.start) — only after
+    // the snapshot capture has resolved and written OniroDragSnap, so
+    // every layer in DragOverlay.ets (all gated on `visible && snap`)
+    // appears in the same frame the snap Image has a texture.
+    // Otherwise the user sees a flash for the 45–700 ms of capture
+    // latency.
+    this.dragController?.show();
   }
 
   private hideDragOverlay(): void {

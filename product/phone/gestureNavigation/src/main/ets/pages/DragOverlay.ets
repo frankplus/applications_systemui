@@ -18,12 +18,12 @@
  * return to the current app, or PAN HORIZONTALLY to bring older
  * recents into the centered slot (snap-to-card on release).
  *
- *   Stack (bottom → top):
- *     1. Black fill                 (fallback if wallpaper missing)
- *     2. Wallpaper Image            (PixelMap from @ohos.wallpaper)
- *     3. Dim Column                 (alpha = backdropAlpha * 0.4)
- *     4. Backdrop tap-zone          (only in recents-mode)
- *     5. Row of cards (wrapped)     (transformed; wrapper handles pan)
+ *   Stack (bottom → top, all gated on visible && snap so nothing
+ *   paints before the snapshot Image is up and covering the screen):
+ *     1. Wallpaper Image            (PixelMap from @ohos.wallpaper)
+ *     2. Dim Column                 (alpha = backdropAlpha * 0.4)
+ *     3. Backdrop tap-zone          (only in recents-mode)
+ *     4. Row of cards (wrapped)     (transformed; wrapper handles pan)
  *
  * The Row sits inside a wrapper Column that owns the pan-driven
  * horizontal translate. The Row itself keeps its springMotion
@@ -222,33 +222,30 @@ struct DragOverlay {
 
   build() {
     Stack() {
-      // 1. Black backdrop fill — only fallback if wallpaper missing.
-      // Gated on `visible` because the drag window is permanently
-      // shown (see ServiceExtAbility.initDragWindow) to dodge the
-      // ~1s cold-path cost of `window.showWindow()` after every
-      // foreground transition. Without this gate the perma-shown
-      // overlay would paint full-screen black on top of every app.
-      if (this.visible) {
-        Column()
-          .width('100%').height('100%')
-          .backgroundColor(Color.Black);
-      }
-
-      // 2. Wallpaper.
-      if (this.visible && this.wallpaper) {
+      // 1. Wallpaper. Gated on `snap` too — until the snapshot Image is
+      // ready to cover everything, paint nothing and let the live
+      // foreground app show through the transparent window. Painting
+      // the wallpaper alone here would still be jarring (user briefly
+      // sees their wallpaper instead of the app they're swiping from),
+      // and painting an opaque-black fallback when wallpaper is null
+      // would cause the very flash this gating prevents.
+      if (this.visible && this.snap && this.wallpaper) {
         Image(this.wallpaper)
           .width('100%').height('100%')
           .objectFit(ImageFit.Cover);
       }
 
-      // 3. Dim layer over wallpaper.
+      // 2. Dim layer over wallpaper. Gated on snap as well so the dim
+      // (40 % black) doesn't paint before the snapshot Image is up —
+      // otherwise during the snap's first-frame GPU upload the dim
+      // would show as a fullscreen darkening flash.
       Column()
         .width('100%').height('100%')
         .backgroundColor(Color.Black)
-        .opacity(this.visible ? this.backdropAlpha * this.maxDim : 0)
+        .opacity(this.visible && this.snap ? this.backdropAlpha * this.maxDim : 0)
         .animation({ curve: curves.springMotion(0.34, 0.82) });
 
-      // 4. Tap-to-dismiss zone — only present in recents mode so a
+      // 3. Tap-to-dismiss zone — only present in recents mode so a
       // mid-drag tap (which can't reach here anyway because the
       // window is non-touchable) can't accidentally dismiss.
       if (this.visible && this.recentsMode) {
@@ -258,7 +255,7 @@ struct DragOverlay {
           .onClick(() => this.returnToForeground());
       }
 
-      // 5. The Row of cards, wrapped so the pan-driven horizontal
+      // 4. The Row of cards, wrapped so the pan-driven horizontal
       // translate is applied OUTSIDE the .animation() boundary —
       // otherwise the spring catches up to the finger lazily and
       // direct manipulation feels mushy.
