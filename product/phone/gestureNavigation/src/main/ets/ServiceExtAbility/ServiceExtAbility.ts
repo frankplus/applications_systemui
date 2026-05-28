@@ -70,6 +70,13 @@ const NAV_MODE_URI =
 const APP_KEY_DOCK_VISIBLE = 'OniroDockVisible';
 const APP_KEY_DOCK_PROGRESS = 'OniroDockProgress';   // 0..1 toward HOLD_DELTA_VP
 const APP_KEY_DOCK_MODE = 'OniroDockMode';           // 'home' | 'recents'
+// Written by phone_dropdownpanel/pages/index.ets when the panel becomes
+// visible / hides. Read here to suppress bottom-edge gestures while the
+// dropdown is interactive (otherwise our HOME/RECENTS commit fights the
+// panel's own swipe-up-to-close PanGesture). systemui HAPs share a
+// process (same bundle, no per-module process attr — proven by the
+// statusbar↔dropdown LocalEvent path) so AppStorage bridges them.
+const APP_KEY_DROPDOWN_PANEL_OPEN = 'OniroDropdownPanelOpen';
 
 // Touch action codes per @ohos.multimodalInput.touchEvent.Action
 const TOUCH_CANCEL = 0;
@@ -104,6 +111,13 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private mouseReceiver = (ev) => this.handleMouse(ev);
   private monitorActive = false;
   private mouseButtonDown = false;
+  // Per AOSP InputConsumer semantics: once we accept a DOWN in the
+  // bottom hot zone, every subsequent MOVE/UP for that pointer is also
+  // consumed (return true from inputMonitor) so the foreground app
+  // doesn't see half a touch stream — even if the recognizer later
+  // rejects the gesture (TRACKING_REJECTED). Reset to null on UP /
+  // CANCEL. Single-pointer model: only one consumed pointer at a time.
+  private consumingPointerId: number | null = null;
 
   private dockWindow: window.Window | null = null;
   private dockShown = false;
@@ -376,18 +390,45 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     const r = this.recognizer;
     if (!r) return false;
     if (this.checkAndSetPerationType() === PanGestureType.GAME_OPERATE) return false;
+
     if (action === TOUCH_DOWN) {
+      // Defer to the dropdown panel when it's interactive — otherwise our
+      // bottom-edge commit fights the panel's own swipe-up-to-close
+      // PanGesture, and the panel can't be dismissed by swiping up.
+      if (AppStorage.Get<boolean>(APP_KEY_DROPDOWN_PANEL_OPEN) === true) {
+        return false;
+      }
       const accepted = r.onPointerDown(id, x, y, timeMs);
-      return false; // never pilfer at DOWN — observation only.
+      if (accepted) {
+        // Pilfer: prevent the foreground app from seeing the DOWN +
+        // subsequent stream. Returning true from inputMonitor's
+        // TouchEventReceiver consumes the event (see
+        // @ohos.multimodalInput.inputMonitor.d.ts line 39-49). Without
+        // this, scrollable apps like Settings consume the same swipe
+        // and scroll while our gesture also runs.
+        this.consumingPointerId = id;
+        return true;
+      }
+      return false;
     }
+
     if (action === TOUCH_MOVE) {
-      r.onPointerMove(id, x, y, timeMs);
+      if (this.consumingPointerId === id) {
+        r.onPointerMove(id, x, y, timeMs);
+        return true;
+      }
       return false;
     }
+
     if (action === TOUCH_UP || action === TOUCH_CANCEL) {
-      r.onPointerEnd(id, x, y, timeMs, action === TOUCH_CANCEL);
+      if (this.consumingPointerId === id) {
+        r.onPointerEnd(id, x, y, timeMs, action === TOUCH_CANCEL);
+        this.consumingPointerId = null;
+        return true;
+      }
       return false;
     }
+
     return false;
   }
 

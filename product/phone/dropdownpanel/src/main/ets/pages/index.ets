@@ -77,6 +77,16 @@ enum DropdownPanelComponentName {
   NOTIFICATION = 'Notification'
 }
 
+// Cross-module flag read by phone_gestureNavigation's bottom-edge
+// recogniser: while true, gesture-nav suppresses HOME/RECENTS commits so
+// the panel's own swipe-up-to-close PanGesture wins on dismiss. Stays
+// process-local (systemui HAPs share a process).
+const APP_KEY_DROPDOWN_PANEL_OPEN = 'OniroDropdownPanelOpen'
+
+function publishDropdownOpen(open: boolean): void {
+  AppStorage.SetOrCreate(APP_KEY_DROPDOWN_PANEL_OPEN, open)
+}
+
 @Entry
 @Component
 struct Index {
@@ -105,6 +115,9 @@ struct Index {
 
   aboutToAppear() {
     Log.showInfo(TAG, `aboutToAppear, start`);
+    // Establish a clean default for gesture-nav: the panel exists in the
+    // tree but is not yet shown to the user.
+    publishDropdownOpen(false)
     WindowManager.setWindowBgColor(WindowType.DROPDOWN_PANEL,'#00000000')
     CommonStyleManager.setAbilityPageName(TAG);
     StyleManager.setStyle();
@@ -245,8 +258,8 @@ struct Index {
 
   onTouchMove(data: TouchMoveData) {
     Log.showDebug(TAG, `onTouchMove, data: ${JSON.stringify(data)}`)
-    // 'top' direction handling moved to the root PanGesture in build() so that
-    // close is finger-tracked instead of a fixed-curve hideSelf. Ignore it here.
+    // 'top' direction handling lives in the root parallelGesture in
+    // build() — Control's inner Scroll no longer preempts it.
     if (data.direction == 'top') {
       return
     } else if (data.direction == 'left' && data.touchComponent == 'notification') {
@@ -286,6 +299,7 @@ struct Index {
     this.componentOptAreaTranslateY = (-this.componentOptAreaHeightPX) + 'px'
     this.backgroundOpacity = 0
     this.showComponentName = showComponentName
+    publishDropdownOpen(true)
     WindowManager.showWindow(WindowType.DROPDOWN_PANEL)
     Trace.start(Trace.CORE_METHOD_START_DROPDOWNPANEL)
     // Defer to next tick so the window finishes its first paint at -H before
@@ -319,6 +333,7 @@ struct Index {
     this.componentOptAreaTranslateY = (-H + Math.min(dy, H)) + 'px'
     this.backgroundOpacity = Math.min(dy / H, 1)
     this.showComponentName = area
+    publishDropdownOpen(true)
     WindowManager.showWindow(WindowType.DROPDOWN_PANEL)
   }
 
@@ -354,6 +369,10 @@ struct Index {
     SHOW_ANIM_CONFIG.onFinish = () => {
       Log.showInfo(TAG, `hideSelf, hide anim finish.`);
     };
+    // Clear the gesture-nav suspend flag synchronously: the panel is no
+    // longer the user's intent target the moment hideSelf is called,
+    // even though the slide-out animation still has ~450 ms to play.
+    publishDropdownOpen(false)
     this._animateTo(SHOW_ANIM_CONFIG, () => {
       this.componentOptAreaTranslateY = (-this.componentOptAreaHeightPX) + 'px'
       this.backgroundOpacity = 0
@@ -417,7 +436,16 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .gesture(
+    // parallelGesture (vs .gesture) so the close-PanGesture also fires
+    // when the Control center is shown — Control wraps its content in
+    // a Scroll (control.ets:69) which would otherwise grab the vertical
+    // pan and preempt the parent. parallelGesture lets both compete:
+    // the Scroll handles its own overflow (none today, but defensive),
+    // and the close-PanGesture also tracks the finger so the panel
+    // slides up under the finger. Notification has no inner Scroll so
+    // it was already working via .gesture; parallelGesture is a strict
+    // superset of that behaviour.
+    .parallelGesture(
       PanGesture({ direction: PanDirection.Up, distance: 5 })
         .onActionStart((e: GestureEvent) => {
           if (this.showComponentName === DropdownPanelComponentName.NONE) return
