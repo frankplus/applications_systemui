@@ -7,8 +7,9 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Bottom-edge gesture-navigation host. Owns the dock peek-in window and
- * the OniroDragOverlay window (which doubles as the Quickstep-style
+ * Bottom-edge gesture-navigation host. Owns the home-indicator bar
+ * (always shown while gesture nav is the active nav mode) and the
+ * OniroDragOverlay window (which doubles as the Quickstep-style
  * Overview surface on RECENTS commit); delegates all swipe recognition
  * to SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
  *
@@ -58,9 +59,9 @@ const FLING_VP_PER_MS = 0.5;         // upward fling above this commits HOME
 const OVERVIEW_MIN_DEGREES = 15;     // shallower strokes are rejected
 const HOLD_MS = 250;                 // legacy hold-to-recents timer
 const HOLD_DRIFT_VP = 24;
-const DOCK_WIDTH_VP = 112;
-const DOCK_HEIGHT_VP = 40;
-const DOCK_BOTTOM_INSET_VP = 12;
+const DOCK_WIDTH_VP = 140;
+const DOCK_HEIGHT_VP = 24;
+const DOCK_BOTTOM_INSET_VP = 4;
 
 const NAV_MODE_GESTURE = '0';
 const NAV_MODE_URI =
@@ -68,8 +69,6 @@ const NAV_MODE_URI =
   Constants.KEY_NAVIGATIONBAR_STATUS;
 
 const APP_KEY_DOCK_VISIBLE = 'OniroDockVisible';
-const APP_KEY_DOCK_PROGRESS = 'OniroDockProgress';   // 0..1 toward HOLD_DELTA_VP
-const APP_KEY_DOCK_MODE = 'OniroDockMode';           // 'home' | 'recents'
 // Written by phone_dropdownpanel/pages/index.ets when the panel becomes
 // visible / hides. Read here to suppress bottom-edge gestures while the
 // dropdown is interactive (otherwise our HOME/RECENTS commit fights the
@@ -120,7 +119,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private consumingPointerId: number | null = null;
 
   private dockWindow: window.Window | null = null;
-  private dockShown = false;
 
   private dragWindow: window.Window | null = null;
   private dragShown = false;
@@ -243,7 +241,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       onTrackingStart: (_sx: number, _sy: number) => {
         Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
         this.resetOverlayForGesture();
-        this.showDock();
         this.dragController?.start();
         // Kick off the recents fetch IN PARALLEL with the snapshot
         // — both can take 100-300 ms but the snapshot blocks the
@@ -263,22 +260,17 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
             this.showDragOverlay();
           });
       },
-      onProgress: (deltaVp: number, mode: ProgressMode, lastX: number, lastY: number) => {
-        if (!this.dockShown) this.showDock();
-        const progress = Math.min(deltaVp / MIN_DELTA_RECENTS_VP, 1);
-        AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, progress);
-        AppStorage.SetOrCreate(APP_KEY_DOCK_MODE, mode);
+      onProgress: (deltaVp: number, _mode: ProgressMode, lastX: number, lastY: number) => {
         this.dragController?.onProgress(deltaVp, lastX, lastY);
       },
       onCommit: (target: GestureEndTarget, info: CommitInfo) => {
         this.handleCommit(target, info);
       },
       onReset: () => {
-        // If commitAnimating, the spring is mid-flight and will
-        // tear down the overlay itself in its onComplete. We still
-        // hide the dock (it's the pre-commit hint, not part of the
-        // commit) but leave the drag overlay alone.
-        this.hideDock();
+        // If commitAnimating, the spring is mid-flight and will tear
+        // down the overlay itself in its onComplete. The home-indicator
+        // dock stays visible across gestures — it only hides when
+        // nav-mode switches away from gesture.
         if (!this.commitAnimating) {
           this.dragController?.reset();
           this.hideDragOverlay();
@@ -313,12 +305,13 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       Log.showInfo(TAG, `navMode changed -> ${raw}`);
       this.navMode = raw;
     }
-    if (this.navMode === NAV_MODE_GESTURE) {
+    const gesture = this.navMode === NAV_MODE_GESTURE;
+    if (gesture) {
       this.startMonitor();
     } else {
       this.stopMonitor();
-      this.hideDock();
     }
+    AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, gesture);
   }
 
   // ---- Input monitor ---------------------------------------------------
@@ -589,9 +582,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         // Pre-show: keep the dock window permanently shown so the
         // ~1s cold-path cost of `showWindow()` after every foreground
         // transition doesn't land on the gesture critical path. The
-        // GestureDock page already gates its content on OniroDockVisible
-        // (opacity 0 + scale 0.8 when invisible) so the perma-shown
-        // window paints nothing until the gesture flips the flag.
+        // GestureDock page gates its content on OniroDockVisible
+        // (opacity 0 when invisible) so the perma-shown window paints
+        // nothing while gesture nav is disabled.
         win.showWindow().catch((e) => {
           Log.showWarn(TAG, `dock pre-show failed: ${JSON.stringify(e)}`);
         });
@@ -601,20 +594,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }).catch((e) => {
       Log.showError(TAG, `createWindow(dock) failed: ${JSON.stringify(e)}`);
     });
-  }
-
-  private showDock(): void {
-    if (this.dockShown || !this.dockWindow) return;
-    this.dockShown = true;
-    // Window is already shown (initDockWindow pre-shows); flipping the
-    // AppStorage flag drives the page's opacity/scale spring.
-    AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, true);
-  }
-
-  private hideDock(): void {
-    AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, false);
-    AppStorage.SetOrCreate(APP_KEY_DOCK_PROGRESS, 0);
-    this.dockShown = false;
   }
 
   private initDragWindow(): void {
