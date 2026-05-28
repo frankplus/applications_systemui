@@ -50,6 +50,13 @@ const TAG = 'GestureNavigation_DragController';
 
 // Settle window for the commit spring before the structural handoff
 // (or, for RECENTS, before flipping the window touchable).
+//
+// HOME could be extended to cover the WMS launcher-appear animation,
+// but on this build the WMS lifecycle takes ~850-1200ms (gated on a
+// vsync-related stall in the event handler), so any "cover" duration
+// makes the gesture sluggish. We accept the visible system animation
+// as the second beat of the HOME transition and keep the gesture
+// snappy.
 export const COMMIT_SPRING_MS = 320;
 
 // AppStorage keys.

@@ -166,6 +166,12 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     this.initDockWindow();
     this.initDragWindow();
     this.initNavModeSubscription();
+    // windowAnimationManager.setController() is registered from
+    // DragOverlay's aboutToAppear instead — registering from a
+    // ServiceExtensionAbility's onCreate crashes at the first
+    // onScreenUnlock with SIGSEGV in libace_napi.z.so. The napi env
+    // captured at setController-time must belong to a UI context
+    // (mirrors launcher's RemoteWindowWrapper.aboutToAppear).
   }
 
   /**
@@ -460,18 +466,26 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       this.recentsLoader.clear();
       this.commitAnimating = false;
     };
+    // HOME: kick off the launcher launch IN PARALLEL with our
+    // shrink-spring instead of after. OHOS's WMS launch animation on
+    // com.ohos.launcher isn't suppressible from a non-system-bundle
+    // caller — see DragOverlay.activateMission for the same reasoning.
+    // By starting the launcher at spring t=0, the system's launch
+    // animation runs underneath our overlay while we shrink; by spring
+    // end the launcher is settled and we just tear down. Without this
+    // the user saw two sequential animations: our shrink-to-dot, then
+    // the launcher's expand-to-fullscreen.
+    if (target === GestureEndTarget.HOME) {
+      this.goHome();
+    }
     this.dragController.commit(target, () => {
       // Spring settled. RECENTS keeps the overlay LIVE as the
       // Overview surface (flip touchable+focusable + watch for
       // user dismissal). HOME / CANCEL tear down immediately —
-      // HOME's structural commit fires here too, after the
-      // overlay has finished its dissolve-to-launcher spring.
+      // the structural commit already fired above.
       if (target === GestureEndTarget.RECENTS) {
         this.enterRecentsMode();
       } else {
-        if (target === GestureEndTarget.HOME) {
-          this.goHome();
-        }
         teardown();
       }
     });

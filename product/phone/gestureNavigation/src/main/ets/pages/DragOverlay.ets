@@ -95,8 +95,15 @@ struct DragOverlay {
     }
   }
 
-  private dismissOverlay(): void {
-    console.log(`${TAG} dismissOverlay`);
+  /**
+   * Final teardown: clear visible+recentsMode flags and hide the
+   * window. Used after the expand-to-fullscreen spring has settled —
+   * the row already covers the screen at scale=1, so hiding here just
+   * reveals whichever app is now in the foreground (the previously-
+   * captured one for a return-to-foreground tap, or the
+   * just-moveMissionToFront'd one for a recent-card activation).
+   */
+  private hideWindow(): void {
     AppStorage.SetOrCreate('OniroDragVisible', false);
     AppStorage.SetOrCreate('OniroDragRecentsMode', false);
     try {
@@ -109,14 +116,89 @@ struct DragOverlay {
     }
   }
 
+  /**
+   * Spring the row so card at `cardIndex` (0 = oldest recent, N =
+   * foreground) ends up filling the screen at scale=1. Used by both
+   * activation (recent card → that card grows to fullscreen, then
+   * moveMissionToFront) and return-to-foreground (tap foreground or
+   * backdrop → foreground card grows back, then hide).
+   *
+   * Math: at scale=1, scrolloffset+posX places the row in raw px. To
+   * land card K at screen origin we need:
+   *   scrollOffsetVp + posX_target + K*(cardW + spacing) = 0
+   * Keep scrollOffsetVp at its current value (avoid a visual jump on
+   * the wrapper which has no spring animation) and solve for posX.
+   *
+   * The scale anchor stays at the foreground card's bottom-center —
+   * not switched to the tapped card — because changing the anchor
+   * mid-spring would jump the visual. With this anchor the foreground
+   * card "grows in place" from screen bottom-center; a tapped recent
+   * card combines growth with a slide toward the centre as scale
+   * approaches 1. Both feel natural and the row arrives at the
+   * fullscreen pose deterministically.
+   */
+  private expandToCard(cardIndex: number, onDone: () => void): void {
+    const cardW = this.cardWidthVp;
+    const sCurrent = this.scrollOffsetVp;
+    const posXTarget = -sCurrent - cardIndex * (cardW + this.spacingVp);
+    const posYTarget = 0;
+    // Don't touch OniroDragAlpha or OniroDragRecentsAlpha: the
+    // foreground and recents Image components bind their .opacity()
+    // to those keys WITHOUT a .animation() modifier of their own
+    // (only the parent Row's .position/.scale spring), so any write
+    // is an instant snap. Fading recents to 0 here would make the
+    // tapped recent vanish before the grow-spring became visible.
+    // Adjacent cards slide off-screen naturally as the row scales
+    // and shifts, so no fade is needed.
+    AppStorage.SetOrCreate('OniroDragScale', 1.0);
+    AppStorage.SetOrCreate('OniroDragRadius', 0);
+    AppStorage.SetOrCreate('OniroDragBackdropAlpha', 0);
+    AppStorage.SetOrCreate('OniroDragRowLeftVp', posXTarget);
+    AppStorage.SetOrCreate('OniroDragRowTopVp', posYTarget);
+    // 320ms matches COMMIT_SPRING_MS in DragController.
+    setTimeout(onDone, 320);
+  }
+
+  private returnToForeground(): void {
+    console.log(`${TAG} returnToForeground`);
+    this.expandToCard(this.recents.length, (): void => this.hideWindow());
+  }
+
   private activateMission(missionId: number): void {
-    console.log(`${TAG} activate mid=${missionId}`);
+    const idx = this.recents.findIndex(
+      (x: RecentsCardData): boolean => x.missionId === missionId);
+    if (idx < 0) {
+      // Card not in our list (shouldn't happen) — skip the expand
+      // animation and fall back to the bare structural commit.
+      console.warn(`${TAG} activate mid=${missionId} not in recents`);
+      missionManager.moveMissionToFront(missionId)
+        .then((): void => this.hideWindow())
+        .catch((e: object): void => {
+          console.error(`${TAG} moveToFront failed: ${JSON.stringify(e)}`);
+          this.hideWindow();
+        });
+      return;
+    }
+    console.log(`${TAG} activate mid=${missionId} idx=${idx}`);
+    // Kick off moveMissionToFront IN PARALLEL with our expand spring.
+    // The system's "window appearing" animation on the target app
+    // runs HIDDEN behind our growing snapshot (which already shows
+    // that exact app), and by the time our spring settles the
+    // foreground swap is fully done — we hide and the user just sees
+    // the now-foreground app at rest, no duplicate animation.
+    //
+    // Why not sequential (spring-then-move): OHOS's WMS window-show
+    // animation isn't suppressible by a non-system-bundle caller —
+    // StartOptions.withAnimation is gated to same-bundle launches at
+    // window_options_utils.cpp:55, and windowAnimationManager.
+    // setController crashes inside libace_napi on every OnScreenUnlock
+    // on this build. So we can't *stop* the system animation; the
+    // best we can do is *cover* it during the time it'd be visible.
     missionManager.moveMissionToFront(missionId)
-      .then((): void => this.dismissOverlay())
       .catch((e: object): void => {
         console.error(`${TAG} moveToFront failed: ${JSON.stringify(e)}`);
-        this.dismissOverlay();
       });
+    this.expandToCard(idx, (): void => this.hideWindow());
   }
 
   private clearMission(missionId: number): void {
@@ -173,7 +255,7 @@ struct DragOverlay {
         Column()
           .width('100%').height('100%')
           .backgroundColor('#00000000')
-          .onClick(() => this.dismissOverlay());
+          .onClick(() => this.returnToForeground());
       }
 
       // 5. The Row of cards, wrapped so the pan-driven horizontal
@@ -221,8 +303,16 @@ struct DragOverlay {
             }, (m: RecentsCardData) => `${m.missionId}`)
 
             // Foreground (captured snapshot) — rightmost, always
-            // opaque during drag; tap (in recents mode only)
-            // dismisses back to the original foreground app.
+            // opaque during drag; tap (in recents mode only) springs
+            // the row back to fullscreen, then hides — gives a
+            // smooth card-grows-back-into-app transition since the
+            // snapshot already shows that exact foreground app.
+            //
+            // .animation() AFTER .opacity() so the commit-spring
+            // (HOME → al=0, CANCEL → al=1) animates instead of
+            // snapping. Without this, alpha jumps instantly to the
+            // target and the user sees the card vanish at gesture-
+            // release instead of fading with the scale animation.
             Image(this.snap)
               .width(this.cardWidthVp)
               .height(this.cardHeightVp)
@@ -230,8 +320,9 @@ struct DragOverlay {
               .clip(true)
               .objectFit(ImageFit.Cover)
               .opacity(this.al)
+              .animation({ curve: curves.springMotion(0.34, 0.82) })
               .onClick(() => {
-                if (this.recentsMode) this.dismissOverlay();
+                if (this.recentsMode) this.returnToForeground();
               });
           }
           .width(this.rowWidthVp)
