@@ -35,7 +35,6 @@
 
 import curves from '@ohos.curves';
 import missionManager from '@ohos.app.ability.missionManager';
-import window from '@ohos.window';
 import { image } from '@kit.ImageKit';
 
 const TAG = 'GestureNavigation_DragOverlay';
@@ -96,24 +95,18 @@ struct DragOverlay {
   }
 
   /**
-   * Final teardown: clear visible+recentsMode flags and hide the
-   * window. Used after the expand-to-fullscreen spring has settled —
-   * the row already covers the screen at scale=1, so hiding here just
-   * reveals whichever app is now in the foreground (the previously-
-   * captured one for a return-to-foreground tap, or the
-   * just-moveMissionToFront'd one for a recent-card activation).
+   * Final teardown: clear visible+recentsMode flags so the page
+   * stops rendering content. We do NOT call `win.hide()` here: the
+   * drag window stays permanently shown (see ServiceExtAbility.
+   * initDragWindow) to avoid the ~1s cold-path cost of `showWindow`
+   * after every foreground transition. The page's conditional
+   * `if (this.visible)` branches make the perma-shown window paint
+   * a fully-transparent surface when content is cleared, so the
+   * user sees the foreground app immediately.
    */
   private hideWindow(): void {
     AppStorage.SetOrCreate('OniroDragVisible', false);
     AppStorage.SetOrCreate('OniroDragRecentsMode', false);
-    try {
-      const win = window.findWindow('OniroDragOverlay');
-      win.hide().catch((e: Error) => {
-        console.warn(`${TAG} hide failed: ${JSON.stringify(e)}`);
-      });
-    } catch (e) {
-      console.warn(`${TAG} findWindow failed: ${JSON.stringify(e)}`);
-    }
   }
 
   /**
@@ -230,9 +223,16 @@ struct DragOverlay {
   build() {
     Stack() {
       // 1. Black backdrop fill — only fallback if wallpaper missing.
-      Column()
-        .width('100%').height('100%')
-        .backgroundColor(Color.Black);
+      // Gated on `visible` because the drag window is permanently
+      // shown (see ServiceExtAbility.initDragWindow) to dodge the
+      // ~1s cold-path cost of `window.showWindow()` after every
+      // foreground transition. Without this gate the perma-shown
+      // overlay would paint full-screen black on top of every app.
+      if (this.visible) {
+        Column()
+          .width('100%').height('100%')
+          .backgroundColor(Color.Black);
+      }
 
       // 2. Wallpaper.
       if (this.visible && this.wallpaper) {

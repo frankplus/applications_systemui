@@ -586,7 +586,15 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         win.setWindowTouchable(false).catch((e) => {
           Log.showWarn(TAG, `dock setTouchable failed: ${JSON.stringify(e)}`);
         });
-        Log.showInfo(TAG, 'dock window content set');
+        // Pre-show: keep the dock window permanently shown so the
+        // ~1s cold-path cost of `showWindow()` after every foreground
+        // transition doesn't land on the gesture critical path. The
+        // GestureDock page already gates its content on OniroDockVisible
+        // (opacity 0 + scale 0.8 when invisible) so the perma-shown
+        // window paints nothing until the gesture flips the flag.
+        win.showWindow().catch((e) => {
+          Log.showWarn(TAG, `dock pre-show failed: ${JSON.stringify(e)}`);
+        });
       }).catch((e) => {
         Log.showError(TAG, `dock setUIContent failed: ${JSON.stringify(e)}`);
       });
@@ -598,10 +606,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private showDock(): void {
     if (this.dockShown || !this.dockWindow) return;
     this.dockShown = true;
+    // Window is already shown (initDockWindow pre-shows); flipping the
+    // AppStorage flag drives the page's opacity/scale spring.
     AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, true);
-    this.dockWindow.showWindow().catch((e) => {
-      Log.showWarn(TAG, `dock show failed: ${JSON.stringify(e)}`);
-    });
   }
 
   private hideDock(): void {
@@ -635,7 +642,17 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         win.setWindowTouchable(false).catch((e) => {
           Log.showWarn(TAG, `drag setTouchable failed: ${JSON.stringify(e)}`);
         });
-        Log.showInfo(TAG, 'drag window content set');
+        // Pre-show: drag overlay window stays permanently visible.
+        // `dragWindow.showWindow()` paid ~1s after every foreground
+        // transition (render-service cold path post-WMS work), while
+        // subsequent show calls without an intervening hide were
+        // ~3ms. By never hiding (and gating every visible layer in
+        // DragOverlay.ets on `this.visible`) we move the cost off
+        // the gesture critical path. `dragShown` still tracks logical
+        // state for resetOverlay, commit, and recents-mode bookkeeping.
+        win.showWindow().catch((e) => {
+          Log.showWarn(TAG, `drag pre-show failed: ${JSON.stringify(e)}`);
+        });
       }).catch((e) => {
         Log.showError(TAG, `drag setUIContent failed: ${JSON.stringify(e)}`);
       });
@@ -647,17 +664,16 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private showDragOverlay(): void {
     if (this.dragShown || !this.dragWindow) return;
     this.dragShown = true;
-    this.dragWindow.showWindow().catch((e) => {
-      Log.showWarn(TAG, `drag show failed: ${JSON.stringify(e)}`);
-    });
+    // Window is already shown (initDragWindow pre-shows). DragController
+    // toggles OniroDragVisible, which drives every visible layer in
+    // DragOverlay.ets — no `showWindow()` call on the gesture path.
   }
 
   private hideDragOverlay(): void {
     if (!this.dragShown || !this.dragWindow) return;
     this.dragShown = false;
-    this.dragWindow.hide().catch((e) => {
-      Log.showWarn(TAG, `drag hide failed: ${JSON.stringify(e)}`);
-    });
+    // Window stays shown; DragController's reset() flips
+    // OniroDragVisible=false, which clears the page's content.
   }
 }
 
