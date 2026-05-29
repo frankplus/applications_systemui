@@ -214,6 +214,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       });
       this.dragWindow = null;
     }
+    this.wallpaperCache.stop();
     this.snapshotCapture.clear();
   }
 
