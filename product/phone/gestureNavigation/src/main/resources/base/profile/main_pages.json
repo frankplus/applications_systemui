@@ -2,6 +2,7 @@
   "src": [
     "pages/GestureDock",
     "pages/RecentsOverlay",
-    "pages/DragOverlay"
+    "pages/DragOverlay",
+    "pages/BackPanel"
   ]
 }

@@ -20,12 +20,14 @@
 
 import ServiceExtension from '@ohos.app.ability.ServiceExtensionAbility';
 import inputMonitor from '@ohos.multimodalInput.inputMonitor';
+import inputEventClient from '@ohos.multimodalInput.inputEventClient';
 import display from '@ohos.display';
 import window from '@ohos.window';
 import settings from '@ohos.settings';
 import data_dataShare from '@ohos.data.dataShare';
 import Log from '../../../../../../../common/src/main/ets/default/Log';
 import Constants from '../../../../../../../common/src/main/ets/default/Constants';
+import { BackPanelController } from '../back/BackPanelController';
 import {
   SwipeRecognizer,
   GestureEndTarget,
@@ -62,6 +64,13 @@ const HOLD_DRIFT_VP = 24;
 const DOCK_WIDTH_VP = 140;
 const DOCK_HEIGHT_VP = 24;
 const DOCK_BOTTOM_INSET_VP = 4;
+
+// Side-edge BACK gesture: a DOWN within this many vp of the left or
+// right screen edge (and NOT in the bottom HOME/RECENTS hot zone) starts
+// a back gesture. AOSP config_backGestureInset default = 30dp.
+const BACK_EDGE_WIDTH_VP = 30;
+// keyCode for BACK (@ohos.multimodalInput.keyCode KEYCODE_BACK).
+const KEYCODE_BACK = 2;
 
 const NAV_MODE_GESTURE = '0';
 const NAV_MODE_URI =
@@ -120,6 +129,16 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   private dockWindow: window.Window | null = null;
 
+  // Side-edge BACK gesture. Owns its own fullscreen overlay window
+  // (the arrow Canvas) and a BackPanelController (state machine + spring
+  // physics, a port of AOSP BackPanelController.kt). Routed entirely
+  // separately from the bottom HOME/RECENTS recognizer; the two own
+  // disjoint hot zones (side edges vs bottom edge) so a pointer belongs
+  // to exactly one of them for its whole lifetime.
+  private backController: BackPanelController | null = null;
+  private backWindow: window.Window | null = null;
+  private backPointerId: number | null = null;
+
   private dragWindow: window.Window | null = null;
   private dragShown = false;
   private snapshotCapture: SnapshotCapture = new SnapshotCapture();
@@ -162,8 +181,17 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     // wallpaper PixelMap); the snap + dim + cards still render normally.
     this.wallpaperCache.load();
     this.recognizer = this.buildRecognizer();
+    this.backController = new BackPanelController(
+      {
+        vpToPx: this.vpToPx,
+        screenWidthPx: this.screenWidthPx,
+        screenHeightPx: this.screenHeightPx,
+      },
+      { triggerBack: () => this.triggerBack() },
+    );
     this.initDockWindow();
     this.initDragWindow();
+    this.initBackWindow();
     this.initNavModeSubscription();
     // windowAnimationManager.setController() is registered from
     // DragOverlay's aboutToAppear instead — registering from a
@@ -213,6 +241,16 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         Log.showWarn(TAG, `destroy drag failed: ${JSON.stringify(e)}`);
       });
       this.dragWindow = null;
+    }
+    if (this.backController) {
+      this.backController.destroy();
+      this.backController = null;
+    }
+    if (this.backWindow) {
+      this.backWindow.destroyWindow().catch((e) => {
+        Log.showWarn(TAG, `destroy back failed: ${JSON.stringify(e)}`);
+      });
+      this.backWindow = null;
     }
     this.wallpaperCache.stop();
     this.snapshotCapture.clear();
@@ -396,6 +434,27 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     if (this.checkAndSetPerationType() === PanGestureType.GAME_OPERATE) return false;
 
     if (action === TOUCH_DOWN) {
+      // Side-edge BACK takes priority on the left/right edge strips, but
+      // only ABOVE the bottom HOME/RECENTS hot zone so the bottom-corner
+      // overlap stays with the home gesture. A DOWN here pilfers the
+      // whole stream into the back controller.
+      const inBottomHotZone =
+        this.screenHeightPx > 0 && y >= this.screenHeightPx - HOT_ZONE_VP * this.vpToPx;
+      // Single-pointer: ignore a second finger while a back gesture (or a
+      // bottom gesture) already owns a pointer.
+      if (!inBottomHotZone && this.backController &&
+          this.backPointerId === null && this.consumingPointerId === null) {
+        const edgePx = BACK_EDGE_WIDTH_VP * this.vpToPx;
+        let isLeft: boolean | null = null;
+        if (x <= edgePx) isLeft = true;
+        else if (x >= this.screenWidthPx - edgePx) isLeft = false;
+        if (isLeft !== null) {
+          this.backController.onPointerDown(x / this.vpToPx, y / this.vpToPx, timeMs, isLeft);
+          this.backPointerId = id;
+          return true;
+        }
+      }
+
       // Defer to the dropdown panel when it's interactive — otherwise our
       // bottom-edge commit fights the panel's own swipe-up-to-close
       // PanGesture, and the panel can't be dismissed by swiping up.
@@ -417,6 +476,10 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }
 
     if (action === TOUCH_MOVE) {
+      if (this.backPointerId === id && this.backController) {
+        this.backController.onPointerMove(x / this.vpToPx, y / this.vpToPx, timeMs);
+        return true;
+      }
       if (this.consumingPointerId === id) {
         r.onPointerMove(id, x, y, timeMs);
         return true;
@@ -425,6 +488,12 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }
 
     if (action === TOUCH_UP || action === TOUCH_CANCEL) {
+      if (this.backPointerId === id && this.backController) {
+        this.backController.onPointerEnd(
+          x / this.vpToPx, y / this.vpToPx, timeMs, action === TOUCH_CANCEL);
+        this.backPointerId = null;
+        return true;
+      }
       if (this.consumingPointerId === id) {
         r.onPointerEnd(id, x, y, timeMs, action === TOUCH_CANCEL);
         this.consumingPointerId = null;
@@ -550,6 +619,23 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     }
   }
 
+  // Inject a BACK key down+up — the same mechanism the 3-button nav bar
+  // uses (features/navigationservice/.../KeyCodeEvent.ts). Called by the
+  // BackPanelController when the side-edge gesture commits.
+  private triggerBack(): void {
+    Log.showInfo(TAG, 'triggerBack');
+    try {
+      inputEventClient.injectEvent({
+        KeyEvent: { isPressed: true, keyCode: KEYCODE_BACK, keyDownDuration: 1, isIntercepted: false },
+      });
+      inputEventClient.injectEvent({
+        KeyEvent: { isPressed: false, keyCode: KEYCODE_BACK, keyDownDuration: 1, isIntercepted: false },
+      });
+    } catch (err) {
+      Log.showError(TAG, `triggerBack injectEvent failed: ${JSON.stringify(err)}`);
+    }
+  }
+
   // Mirror of SCBGestureNavBarViewModel.checkAndSetPerationType: returns
   // GAME_OPERATE for apps that opt out of nav gestures. Stub for now —
   // hook point for future IME-active / game-mode / anti-touch rules.
@@ -642,6 +728,48 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       });
     }).catch((e) => {
       Log.showError(TAG, `createWindow(drag) failed: ${JSON.stringify(e)}`);
+    });
+  }
+
+  /**
+   * Fullscreen overlay window hosting the back-arrow Canvas
+   * (pages/BackPanel). Same recipe as the drag overlay: a
+   * TYPE_VOLUME_OVERLAY that floats above the foreground app,
+   * non-touchable (the recognizer reads touches off inputMonitor) and
+   * pre-shown permanently — the BackPanel page paints a fully
+   * transparent surface until the controller flips the frame to
+   * visible, so there's no per-gesture showWindow() cold-path cost.
+   */
+  private initBackWindow(): void {
+    const cfg: window.Configuration = {
+      name: 'OniroBackPanel',
+      windowType: window.WindowType.TYPE_VOLUME_OVERLAY,
+      ctx: this.context,
+    };
+    window.createWindow(cfg).then((win) => {
+      this.backWindow = win;
+      win.resize(this.screenWidthPx, this.screenHeightPx).catch((e) => {
+        Log.showWarn(TAG, `back resize failed: ${JSON.stringify(e)}`);
+      });
+      win.moveWindowTo(0, 0).catch((e) => {
+        Log.showWarn(TAG, `back move failed: ${JSON.stringify(e)}`);
+      });
+      win.setUIContent('pages/BackPanel').then(() => {
+        win.setWindowBackgroundColor('#00000000');
+        win.setWindowFocusable(false).catch((e) => {
+          Log.showWarn(TAG, `back setFocusable failed: ${JSON.stringify(e)}`);
+        });
+        win.setWindowTouchable(false).catch((e) => {
+          Log.showWarn(TAG, `back setTouchable failed: ${JSON.stringify(e)}`);
+        });
+        win.showWindow().catch((e) => {
+          Log.showWarn(TAG, `back pre-show failed: ${JSON.stringify(e)}`);
+        });
+      }).catch((e) => {
+        Log.showError(TAG, `back setUIContent failed: ${JSON.stringify(e)}`);
+      });
+    }).catch((e) => {
+      Log.showError(TAG, `createWindow(back) failed: ${JSON.stringify(e)}`);
     });
   }
 
