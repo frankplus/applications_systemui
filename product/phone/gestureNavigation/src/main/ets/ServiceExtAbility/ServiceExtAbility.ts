@@ -19,6 +19,7 @@
  */
 
 import ServiceExtension from '@ohos.app.ability.ServiceExtensionAbility';
+import abilityManager from '@ohos.app.ability.abilityManager';
 import inputMonitor from '@ohos.multimodalInput.inputMonitor';
 import inputEventClient from '@ohos.multimodalInput.inputEventClient';
 import display from '@ohos.display';
@@ -71,6 +72,14 @@ const DOCK_BOTTOM_INSET_VP = 4;
 const BACK_EDGE_WIDTH_VP = 30;
 // keyCode for BACK (@ohos.multimodalInput.keyCode KEYCODE_BACK).
 const KEYCODE_BACK = 2;
+
+// The side-edge BACK gesture is suppressed while the launcher (home
+// screen) is the foreground app: there's nothing to navigate "back" to on
+// the home screen, and a side swipe there should reach the launcher
+// untouched (e.g. its own page switching).
+const LAUNCHER_BUNDLE = 'com.ohos.launcher';
+// Throttle for the self-healing getTopAbility() re-query on touch DOWN.
+const FG_CHECK_THROTTLE_MS = 1500;
 
 const NAV_MODE_GESTURE = '0';
 const NAV_MODE_URI =
@@ -139,6 +148,18 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private backWindow: window.Window | null = null;
   private backPointerId: number | null = null;
 
+  // Cached "is the launcher the current foreground app" flag, read
+  // synchronously at touch-DOWN to gate the side-edge BACK gesture. The
+  // launcher is NOT a normal mission on this platform (it lives in a
+  // separate, empty LAUNCHER mission list that getMissionInfos never
+  // reports), so the foreground app is read via abilityManager.getTopAbility()
+  // (systemapi, no permission needed). Kept fresh reactively by WMS's
+  // systemBarTintChange event (fires on foreground-window changes), plus a
+  // throttled re-query on touch DOWN as a self-healing fallback.
+  private foregroundIsLauncher = false;
+  private tintChangeCb = (_state) => this.refreshForegroundIsLauncher();
+  private lastForegroundCheckMs = 0;
+
   private dragWindow: window.Window | null = null;
   private dragShown = false;
   private snapshotCapture: SnapshotCapture = new SnapshotCapture();
@@ -193,6 +214,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     this.initDragWindow();
     this.initBackWindow();
     this.initNavModeSubscription();
+    this.initForegroundTracking();
     // windowAnimationManager.setController() is registered from
     // DragOverlay's aboutToAppear instead — registering from a
     // ServiceExtensionAbility's onCreate crashes at the first
@@ -251,6 +273,11 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         Log.showWarn(TAG, `destroy back failed: ${JSON.stringify(e)}`);
       });
       this.backWindow = null;
+    }
+    try {
+      window.off('systemBarTintChange', this.tintChangeCb);
+    } catch (e) {
+      Log.showWarn(TAG, `systemBarTintChange off failed: ${JSON.stringify(e)}`);
     }
     this.wallpaperCache.stop();
     this.snapshotCapture.clear();
@@ -357,6 +384,44 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, gesture);
   }
 
+  // ---- Foreground-app (launcher) tracking ------------------------------
+
+  /**
+   * Subscribe to WMS's systemBarTintChange (fires when the foreground
+   * window changes — the launcher and apps apply different system-bar
+   * styles) and do an initial foreground read. systemui's TintStateManager
+   * already relies on this same event for status-bar tinting.
+   */
+  private initForegroundTracking(): void {
+    try {
+      window.on('systemBarTintChange', this.tintChangeCb);
+      Log.showInfo(TAG, 'systemBarTintChange subscribed (launcher tracking)');
+    } catch (e) {
+      Log.showError(TAG, `systemBarTintChange subscribe failed: ${JSON.stringify(e)}`);
+    }
+    this.refreshForegroundIsLauncher();
+  }
+
+  /**
+   * Re-read the foreground (top) ability and cache whether it's the
+   * launcher. getTopAbility() returns the real top ability's ElementName
+   * regardless of mission-list type, so it sees the launcher (which is not
+   * a queryable mission). Only logs on a state change.
+   */
+  private refreshForegroundIsLauncher(): void {
+    this.lastForegroundCheckMs = Date.now();
+    abilityManager.getTopAbility().then((top) => {
+      const b: string = top?.bundleName ?? '';
+      const isLauncher = b === LAUNCHER_BUNDLE;
+      if (isLauncher !== this.foregroundIsLauncher) {
+        this.foregroundIsLauncher = isLauncher;
+        Log.showInfo(TAG, `foregroundIsLauncher -> ${isLauncher} (top=${b})`);
+      }
+    }).catch((e) => {
+      Log.showWarn(TAG, `getTopAbility failed: ${JSON.stringify(e)}`);
+    });
+  }
+
   // ---- Input monitor ---------------------------------------------------
 
   private startMonitor(): void {
@@ -434,15 +499,24 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     if (this.checkAndSetPerationType() === PanGestureType.GAME_OPERATE) return false;
 
     if (action === TOUCH_DOWN) {
+      // Self-healing fallback for the launcher flag: if systemBarTintChange
+      // ever missed a foreground transition, re-query here (throttled).
+      // Async, so it corrects the NEXT gesture — the reactive event +
+      // goHome() optimistic set cover the immediate case.
+      if (Date.now() - this.lastForegroundCheckMs > FG_CHECK_THROTTLE_MS) {
+        this.refreshForegroundIsLauncher();
+      }
       // Side-edge BACK takes priority on the left/right edge strips, but
       // only ABOVE the bottom HOME/RECENTS hot zone so the bottom-corner
-      // overlap stays with the home gesture. A DOWN here pilfers the
-      // whole stream into the back controller.
+      // overlap stays with the home gesture, and NOT while the launcher
+      // (home screen) is foreground — there's nothing to go back to there,
+      // and the swipe should reach the launcher untouched. A DOWN here
+      // pilfers the whole stream into the back controller.
       const inBottomHotZone =
         this.screenHeightPx > 0 && y >= this.screenHeightPx - HOT_ZONE_VP * this.vpToPx;
       // Single-pointer: ignore a second finger while a back gesture (or a
       // bottom gesture) already owns a pointer.
-      if (!inBottomHotZone && this.backController &&
+      if (!inBottomHotZone && !this.foregroundIsLauncher && this.backController &&
           this.backPointerId === null && this.consumingPointerId === null) {
         const edgePx = BACK_EDGE_WIDTH_VP * this.vpToPx;
         let isLeft: boolean | null = null;
@@ -609,6 +683,11 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   private goHome(): void {
     Log.showInfo(TAG, 'goHome');
+    // Bringing the launcher to the front — suppress the side-edge BACK
+    // gesture immediately rather than waiting for systemBarTintChange, so a
+    // back-swipe right after this is ignored. The reactive event / DOWN
+    // re-query self-correct this if the startAbility below fails.
+    this.foregroundIsLauncher = true;
     try {
       this.context.startAbility({
         bundleName: 'com.ohos.launcher',
