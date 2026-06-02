@@ -23,6 +23,7 @@ import { NavigationBarComponentData, NAVIGATIONBAR_HIDE_EVENT } from '../common/
 import dataShare from '@ohos.data.dataShare';
 import settings from '@ohos.settings';
 import commonEvent from '@ohos.commonEvent';
+import display from '@ohos.display';
 import AbilityManager from '../../../../../../../common/src/main/ets/default/abilitymanager/abilityManager';
 import Constants from '../../../../../../../common/src/main/ets/default/Constants';
 
@@ -42,6 +43,12 @@ export default class NavigationBarViewModel {
   private readonly helper: dataShare.DataShareHelper;
   private readonly navigationBarStatusDefaultValue = '1';
   private isDisplay = true;
+  // Gesture-navigation mode keeps the nav-bar window shown as a thin
+  // home-indicator strip (instead of hiding it), so the window manager still
+  // reports a bottom avoid area / safe-area inset to apps and the indicator
+  // pill doesn't overlap app content. 24vp ≈ the home-indicator zone.
+  private readonly gestureIndicatorVp = 24;
+  private gestureMode = false;
   mNavigationBarComponentData: NavigationBarComponentData  = {
     ...new NavigationBarComponentData()
   };
@@ -196,28 +203,78 @@ export default class NavigationBarViewModel {
     this.windowSwitches(getRetValue);
   }
 
-  private windowSwitches(navigationBarStatusValue: string): void {
-    this.isDisplay = navigationBarStatusValue == '1' ? true : false;
-    if (!this.isDisplay || !this.mNavigationBarComponentData.isEnable) {
-      //For gesture navigation scenarios
-      //Systemui hides the navigation bar,and then notifies the launcher that it can start moving down the dock bar.
-      WindowManager.hideWindow(WindowType.NAVIGATION_BAR).then(() => {
-        if(!this.isDisplay){
-          commonEvent.publish(NAVIGATIONBAR_HIDE_EVENT, (err) => {
-            if (err.code) {
-              Log.showError(TAG, `${NAVIGATIONBAR_HIDE_EVENT} PublishCallBack err: ${JSON.stringify(err)}`);
-            } else {
-              Log.showInfo(TAG, `${NAVIGATIONBAR_HIDE_EVENT} Publish sucess`);
-            }
-          })
-        }
-      }).catch((err) => {
-        Log.showError(TAG, `${NAVIGATIONBAR_HIDE_EVENT} Publish catch err: ${JSON.stringify(err)}`);
-      });
-    } else {
-      WindowManager.showWindow(WindowType.NAVIGATION_BAR).then(() => {
-      }).catch((err) => {
-      });
+  /**
+   * Geometry of the nav-bar window for the active mode.
+   * - 3-button mode: the full button bar (rect from NavBarConfiguration).
+   * - gesture mode: a thin home-indicator strip pinned to the bottom edge,
+   *   as wide as the screen. Keeping a real TYPE_NAVIGATION_BAR window shown
+   *   (rather than hiding it) is what makes the window manager report a
+   *   bottom avoid area to apps in gesture mode.
+   */
+  private getNavBarRect(gesture: boolean): { left: number, top: number, width: number, height: number } {
+    let config = AbilityManager.getAbilityData(AbilityManager.ABILITY_NAME_NAVIGATION_BAR, 'config');
+    let maxWidth = config?.maxWidth ?? 0;
+    let maxHeight = config?.maxHeight ?? 0;
+    if (!gesture) {
+      return {
+        left: config?.xCoordinate ?? 0,
+        top: config?.yCoordinate ?? 0,
+        width: config?.realWidth ?? maxWidth,
+        height: config?.realHeight ?? 0
+      };
     }
+    let density = 2;
+    try {
+      density = display.getDefaultDisplaySync().densityPixels;
+    } catch (err) {
+      Log.showError(TAG, `getDefaultDisplaySync failed: ${JSON.stringify(err)}`);
+    }
+    let height = Math.round(this.gestureIndicatorVp * density);
+    return { left: 0, top: maxHeight - height, width: maxWidth, height: height };
+  }
+
+  private windowSwitches(navigationBarStatusValue: string): void {
+    let gesture = navigationBarStatusValue == '0';
+    this.gestureMode = gesture;
+    // The nav-bar window is shown in BOTH modes now. Surface the mode to the
+    // window's UI (pages/index) so it draws the home-indicator pill in gesture
+    // mode and the 3 buttons otherwise.
+    AppStorage.SetOrCreate('navBarGestureMode', gesture);
+    // The window participates in both modes; only its size differs. It is only
+    // hidden when an app opts out of the nav bar (isEnable=false, e.g. an
+    // immersive/full-screen surface).
+    this.isDisplay = true;
+    let rect = this.getNavBarRect(gesture);
+    WindowManager.resetSizeWindow(WindowType.NAVIGATION_BAR, rect).then(() => {
+      // In gesture mode the strip is a passive indicator: make it
+      // non-touchable so the bottom-edge swipe reaches the gesture recogniser
+      // (which reads raw touches off inputMonitor) instead of being consumed
+      // by this window. In 3-button mode the buttons must stay tappable.
+      WindowManager.setWindowTouchable(WindowType.NAVIGATION_BAR, !gesture);
+      if (this.mNavigationBarComponentData.isEnable) {
+        WindowManager.showWindow(WindowType.NAVIGATION_BAR).catch((err) => {
+          Log.showError(TAG, `showWindow err: ${JSON.stringify(err)}`);
+        });
+      } else {
+        WindowManager.hideWindow(WindowType.NAVIGATION_BAR).catch((err) => {
+          Log.showError(TAG, `hideWindow err: ${JSON.stringify(err)}`);
+        });
+      }
+      // Nudge the launcher to recompute its bottom inset for gesture mode (it
+      // then reserves the indicator-strip height). The legacy event name is
+      // kept because that is what the launcher already listens for to switch
+      // into its "gesture" layout.
+      if (gesture) {
+        commonEvent.publish(NAVIGATIONBAR_HIDE_EVENT, (err) => {
+          if (err.code) {
+            Log.showError(TAG, `${NAVIGATIONBAR_HIDE_EVENT} PublishCallBack err: ${JSON.stringify(err)}`);
+          } else {
+            Log.showInfo(TAG, `${NAVIGATIONBAR_HIDE_EVENT} Publish sucess`);
+          }
+        });
+      }
+    }).catch((err) => {
+      Log.showError(TAG, `resetSizeWindow err: ${JSON.stringify(err)}`);
+    });
   }
 }

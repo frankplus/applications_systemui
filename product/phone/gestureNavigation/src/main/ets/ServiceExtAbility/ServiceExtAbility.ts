@@ -7,11 +7,16 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Bottom-edge gesture-navigation host. Owns the home-indicator bar
- * (always shown while gesture nav is the active nav mode) and the
- * OniroDragOverlay window (which doubles as the Quickstep-style
- * Overview surface on RECENTS commit); delegates all swipe recognition
- * to SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
+ * Bottom-edge gesture-navigation host. Owns the OniroDragOverlay window
+ * (which doubles as the Quickstep-style Overview surface on RECENTS commit)
+ * and the side-edge BackPanel; delegates all swipe recognition to
+ * SwipeRecognizer (a port of AOSP Launcher3 Quickstep).
+ *
+ * The static home-indicator pill is NOT owned here anymore: it is drawn by
+ * the navigation-bar window (product/default/navigationBar, pages/index)
+ * which, in gesture mode, shrinks to a thin home-indicator strip. That strip
+ * is a real TYPE_NAVIGATION_BAR window, so it also reserves the bottom avoid
+ * area for apps — which a floating toast overlay never did.
  *
  * Quickstep parity work lives in ./recognizer/ — this file only wires
  * inputMonitor events into the recognizer and translates its callbacks
@@ -62,9 +67,6 @@ const FLING_VP_PER_MS = 0.5;         // upward fling above this commits HOME
 const OVERVIEW_MIN_DEGREES = 15;     // shallower strokes are rejected
 const HOLD_MS = 250;                 // legacy hold-to-recents timer
 const HOLD_DRIFT_VP = 24;
-const DOCK_WIDTH_VP = 140;
-const DOCK_HEIGHT_VP = 24;
-const DOCK_BOTTOM_INSET_VP = 4;
 
 // Side-edge BACK gesture: a DOWN within this many vp of the left or
 // right screen edge (and NOT in the bottom HOME/RECENTS hot zone) starts
@@ -86,7 +88,6 @@ const NAV_MODE_URI =
   'datashare:///com.ohos.settingsdata/entry/settingsdata/SETTINGSDATA?Proxy=true&key=' +
   Constants.KEY_NAVIGATIONBAR_STATUS;
 
-const APP_KEY_DOCK_VISIBLE = 'OniroDockVisible';
 // Written by phone_dropdownpanel/pages/index.ets when the panel becomes
 // visible / hides. Read here to suppress bottom-edge gestures while the
 // dropdown is interactive (otherwise our HOME/RECENTS commit fights the
@@ -135,8 +136,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   // rejects the gesture (TRACKING_REJECTED). Reset to null on UP /
   // CANCEL. Single-pointer model: only one consumed pointer at a time.
   private consumingPointerId: number | null = null;
-
-  private dockWindow: window.Window | null = null;
 
   // Side-edge BACK gesture. Owns its own fullscreen overlay window
   // (the arrow Canvas) and a BackPanelController (state machine + spring
@@ -221,7 +220,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       },
       { triggerBack: () => this.triggerBack() },
     );
-    this.initDockWindow();
     this.initDragWindow();
     this.initBackWindow();
     this.initNavModeSubscription();
@@ -263,12 +261,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     this.stopMonitor();
     this.dataShareHelper?.off('dataChange', NAV_MODE_URI);
     this.dataShareHelper = null;
-    if (this.dockWindow) {
-      this.dockWindow.destroyWindow().catch((e) => {
-        Log.showWarn(TAG, `destroy dock failed: ${JSON.stringify(e)}`);
-      });
-      this.dockWindow = null;
-    }
     if (this.dragWindow) {
       this.dragWindow.destroyWindow().catch((e) => {
         Log.showWarn(TAG, `destroy drag failed: ${JSON.stringify(e)}`);
@@ -392,7 +384,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     } else {
       this.stopMonitor();
     }
-    AppStorage.SetOrCreate(APP_KEY_DOCK_VISIBLE, gesture);
+    // The visible home-indicator pill is owned by the navigation-bar window
+    // now (it shows the pill in gesture mode, the 3 buttons otherwise), so
+    // there is no dock visibility to toggle here — only the swipe recogniser.
   }
 
   // ---- Foreground-app (launcher) tracking ------------------------------
@@ -746,49 +740,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     return PanGestureType.DEFAULT;
   }
 
-  // ---- Dock + recents window plumbing ---------------------------------
-
-  private initDockWindow(): void {
-    const widthPx = Math.round(DOCK_WIDTH_VP * this.vpToPx);
-    const heightPx = Math.round(DOCK_HEIGHT_VP * this.vpToPx);
-    const bottomPx = Math.round(DOCK_BOTTOM_INSET_VP * this.vpToPx);
-    const left = Math.round((this.screenWidthPx - widthPx) / 2);
-    const top = Math.round(this.screenHeightPx - heightPx - bottomPx);
-
-    const cfg: window.Configuration = {
-      name: 'OniroGestureDock',
-      windowType: window.WindowType.TYPE_SYSTEM_TOAST,
-      ctx: this.context,
-    };
-    window.createWindow(cfg).then((win) => {
-      this.dockWindow = win;
-      win.resize(widthPx, heightPx).catch((e) => {
-        Log.showWarn(TAG, `dock resize failed: ${JSON.stringify(e)}`);
-      });
-      win.moveWindowTo(left, top).catch((e) => {
-        Log.showWarn(TAG, `dock move failed: ${JSON.stringify(e)}`);
-      });
-      win.setUIContent('pages/GestureDock').then(() => {
-        win.setWindowBackgroundColor('#00000000');
-        win.setWindowTouchable(false).catch((e) => {
-          Log.showWarn(TAG, `dock setTouchable failed: ${JSON.stringify(e)}`);
-        });
-        // Pre-show: keep the dock window permanently shown so the
-        // ~1s cold-path cost of `showWindow()` after every foreground
-        // transition doesn't land on the gesture critical path. The
-        // GestureDock page gates its content on OniroDockVisible
-        // (opacity 0 when invisible) so the perma-shown window paints
-        // nothing while gesture nav is disabled.
-        win.showWindow().catch((e) => {
-          Log.showWarn(TAG, `dock pre-show failed: ${JSON.stringify(e)}`);
-        });
-      }).catch((e) => {
-        Log.showError(TAG, `dock setUIContent failed: ${JSON.stringify(e)}`);
-      });
-    }).catch((e) => {
-      Log.showError(TAG, `createWindow(dock) failed: ${JSON.stringify(e)}`);
-    });
-  }
+  // ---- Drag + recents window plumbing ---------------------------------
 
   private initDragWindow(): void {
     // TYPE_VOLUME_OVERLAY + setWindowTouchable(false) lets the overlay

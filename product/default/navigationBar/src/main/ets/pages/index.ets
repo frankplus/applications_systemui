@@ -32,6 +32,10 @@ struct Index {
   // @StorageLink('navigationLayoutConfig') mConfig: object = {}
   @StorageLink('minNavHeight') minNavHeight: number = 32
   @StorageLink("showNavHorizontal") showNavHorizontal: boolean = true
+  // true while gesture navigation is the active mode: the nav-bar window is a
+  // thin home-indicator strip and we draw the indicator pill instead of the
+  // three buttons. Driven by NavigationBarViewModel.windowSwitches.
+  @StorageLink('navBarGestureMode') gestureMode: boolean = false
   @State mNavigationBarComponentData: NavigationBarComponentData = new NavigationBarComponentData()
 
   onBackPress(): boolean {
@@ -63,12 +67,23 @@ struct Index {
 
   build() {
     Flex({ direction: FlexDirection.Column, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Center }) {
-      Three();
+      if (this.gestureMode) {
+        // Home-indicator pill (static iOS/Android-style handle). The strip
+        // window itself reserves the bottom margin; this is just the glyph.
+        Column()
+          .width(108)
+          .height(5)
+          .borderRadius(2.5)
+          .backgroundColor('#E6FFFFFF')
+          .shadow({ radius: 6, color: '#40000000', offsetX: 0, offsetY: 1 })
+      } else {
+        Three();
+      }
     }
     .width('100%')
     .height('100%')
     .constraintSize({ minHeight: this.minNavHeight + 'px' })
-    .backgroundColor(this.mNavigationBarComponentData.backgroundColor)
-    .padding(this.showNavHorizontal ? { left: '18%', right: '18%' } : { top: '18%', bottom: '18%' })
+    .backgroundColor(this.gestureMode ? Color.Transparent : this.mNavigationBarComponentData.backgroundColor)
+    .padding(this.gestureMode ? { left: 0, right: 0 } : (this.showNavHorizontal ? { left: '18%', right: '18%' } : { top: '18%', bottom: '18%' }))
   }
 }
