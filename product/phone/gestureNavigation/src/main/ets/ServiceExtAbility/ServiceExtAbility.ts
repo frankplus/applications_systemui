@@ -28,7 +28,7 @@ import settings from '@ohos.settings';
 import data_dataShare from '@ohos.data.dataShare';
 import Log from '../../../../../../../common/src/main/ets/default/Log';
 import Constants from '../../../../../../../common/src/main/ets/default/Constants';
-import { BackPanelController } from '../back/BackPanelController';
+import { BackPanelController, GestureState } from '../back/BackPanelController';
 import {
   SwipeRecognizer,
   GestureEndTarget,
@@ -147,6 +147,17 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private backController: BackPanelController | null = null;
   private backWindow: window.Window | null = null;
   private backPointerId: number | null = null;
+  // Deferred pilfer: a side-edge DOWN starts TRACKING the pointer but is
+  // NOT consumed (inputMonitor returns false) until the controller leaves
+  // GONE — i.e. horizontal slop is crossed and it's a confirmed back-swipe.
+  // Until then the touch falls through to the foreground app so taps on
+  // edge-anchored UI (e.g. the leftmost/rightmost keyboard keys, which sit
+  // inside the 30vp BACK strip) are not swallowed. AOSP achieves the same
+  // with InputMonitor.pilferPointers(); OHOS's touch monitor has no such
+  // call (return-bool is the only lever), so on a real swipe the app sees a
+  // benign half-stream (DOWN + sub-slop MOVEs, no UP) — keyboards commit on
+  // UP, which we then own, so no stray character is typed.
+  private backPilfered = false;
 
   // Cached "is the launcher the current foreground app" flag, read
   // synchronously at touch-DOWN to gate the side-edge BACK gesture. The
@@ -510,8 +521,10 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       // only ABOVE the bottom HOME/RECENTS hot zone so the bottom-corner
       // overlap stays with the home gesture, and NOT while the launcher
       // (home screen) is foreground — there's nothing to go back to there,
-      // and the swipe should reach the launcher untouched. A DOWN here
-      // pilfers the whole stream into the back controller.
+      // and the swipe should reach the launcher untouched. A DOWN here only
+      // TRACKS the pointer; consuming is deferred until the swipe is
+      // confirmed (see backPilfered / TOUCH_MOVE below), so a tap on an
+      // edge-anchored target like a keyboard key still reaches the app.
       const inBottomHotZone =
         this.screenHeightPx > 0 && y >= this.screenHeightPx - HOT_ZONE_VP * this.vpToPx;
       // Single-pointer: ignore a second finger while a back gesture (or a
@@ -525,7 +538,8 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
         if (isLeft !== null) {
           this.backController.onPointerDown(x / this.vpToPx, y / this.vpToPx, timeMs, isLeft);
           this.backPointerId = id;
-          return true;
+          this.backPilfered = false; // not consuming yet — wait for slop
+          return false;              // let the app/keyboard see the DOWN
         }
       }
 
@@ -552,7 +566,13 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     if (action === TOUCH_MOVE) {
       if (this.backPointerId === id && this.backController) {
         this.backController.onPointerMove(x / this.vpToPx, y / this.vpToPx, timeMs);
-        return true;
+        // Deferred pilfer: the controller leaves GONE only once horizontal
+        // slop (EDGE_SLOP_VP) is crossed — a confirmed back-swipe, not a tap
+        // or a vertical scroll. From that point on we own the stream.
+        if (!this.backPilfered && this.backController.currentState !== GestureState.GONE) {
+          this.backPilfered = true;
+        }
+        return this.backPilfered;
       }
       if (this.consumingPointerId === id) {
         r.onPointerMove(id, x, y, timeMs);
@@ -565,8 +585,12 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       if (this.backPointerId === id && this.backController) {
         this.backController.onPointerEnd(
           x / this.vpToPx, y / this.vpToPx, timeMs, action === TOUCH_CANCEL);
+        const consumed = this.backPilfered;
         this.backPointerId = null;
-        return true;
+        this.backPilfered = false;
+        // A tap (never pilfered) returns false so the app sees the UP and
+        // the key registers; a confirmed swipe returns true (we owned it).
+        return consumed;
       }
       if (this.consumingPointerId === id) {
         r.onPointerEnd(id, x, y, timeMs, action === TOUCH_CANCEL);
