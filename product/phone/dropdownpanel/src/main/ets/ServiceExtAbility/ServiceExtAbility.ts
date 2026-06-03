@@ -43,9 +43,40 @@ class ServiceExtAbility extends ServiceExtension {
         height: dis.height,
       };
       AbilityManager.setAbilityData(AbilityManager.ABILITY_NAME_DROPDOWN_PANEL, 'rect', rect);
-      WindowManager.createWindow(this.context, WindowType.DROPDOWN_PANEL, rect, 'pages/index').then( (win) => {
-        win.setLayoutFullScreen(true);
-        Log.showInfo(TAG, 'onCreate, createWindow callback');
+      WindowManager.createWindow(this.context, WindowType.DROPDOWN_PANEL, rect, 'pages/index').then( async (win) => {
+        // Let the panel draw to the very top edge (y=0) over the system status
+        // bar so its OWN status-bar header is the single visible bar and the
+        // close animation can slide the whole panel off the top edge. Two steps,
+        // both required on the legacy WMS:
+        //   - setWindowLayoutFullScreen(true): full-screen ArkUI viewport.
+        //   - setWindowSystemBarEnable([]): drops the status-bar avoid area —
+        //     WITHOUT it the page content is clipped at the status-bar line
+        //     (expandSafeArea is not honoured here). It also suppresses the
+        //     system STATUS_BAR window while the panel is foreground, so the
+        //     panel's own header is the single bar (no double bar, and no
+        //     explicit STATUS_BAR show/hide which would cost ~1 s per toggle).
+        try {
+          await win.setWindowLayoutFullScreen(true);
+          await win.setWindowSystemBarEnable([]);
+        } catch (e) {
+          Log.showWarn(TAG, `dropdown immersive setup failed: ${JSON.stringify(e)}`);
+        }
+        // Pre-show the panel ONCE and keep it shown for the process lifetime.
+        // Toggling showWindow()/hide() per open/close paid a ~1 s cold-path lag
+        // on reopen and churned the RenderService surface — the surface teardown
+        // on hide() is what tripped the Mali NULL+0x1d8 crash in RSRenderThread
+        // on close. While "closed" the page renders nothing (panelActive=false →
+        // transparent) and the window is non-touchable, so it neither covers the
+        // screen nor captures touches. index.ets flips touchability + rendering.
+        try {
+          await win.setWindowTouchable(false);
+        } catch (e) {
+          Log.showWarn(TAG, `dropdown pre-show setTouchable failed: ${JSON.stringify(e)}`);
+        }
+        win.showWindow().catch((e: Error) => {
+          Log.showWarn(TAG, `dropdown pre-show failed: ${JSON.stringify(e)}`);
+        });
+        Log.showInfo(TAG, 'onCreate, createWindow callback (pre-shown, fullscreen, non-touchable)');
       }).catch((err) => {
       });
 

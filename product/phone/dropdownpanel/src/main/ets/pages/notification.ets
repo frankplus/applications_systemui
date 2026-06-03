@@ -13,21 +13,11 @@
  * limitations under the License.
  */
 
-import {isNfcAvailable} from '../../../../../../../common/src/main/ets/default/Constants';
 import AbilityManager from '../../../../../../../common/src/main/ets/default/abilitymanager/abilityManager';
 import Log from '../../../../../../../common/src/main/ets/default/Log';
 import EventManager, { unsubscribe }  from "../../../../../../../common/src/main/ets/default/event/EventManager";
 import { obtainStartAbility } from "../../../../../../../common/src/main/ets/default/event/EventUtil";
 import Constants from './common/constants';
-import BatteryIcon from '../../../../../../../features/batterycomponent/src/main/ets/default/pages/batteryIcon';
-import ClockIcon from '../../../../../../../features/clockcomponent/src/main/ets/default/pages/clockIcon';
-import AirplaneIcon from '../../../../../../../features/airplanecomponent/src/main/ets/default/pages/StatusBarIconItemAirplaneComponent';
-import WifiIcon from '../../../../../../../features/wificomponent/src/main/ets/default/pages/wifiIcon';
-import BluetoothIcon from '../../../../../../../features/bluetoothcomponent/src/main/ets/com/ohos/pages/StatusBarIconItemBluetoothComponent';
-import SignalIcon from '../../../../../../../features/signalcomponent/src/main/ets/default/pages/signalIcon';
-import LocationIcon from '../../../../../../../features/locationcomponent/src/main/ets/com/ohos/pages/StatusBarIconItemLocationComponent';
-import RingModeIcon from '../../../../../../../features/ringmodecomponent/src/main/ets/com/ohos/pages/StatusBarIconItemRingModeComponent';
-import NfcIcon from '../../../../../../../features/nfccomponent/src/main/ets/com/ohos/pages/StatusBarIconItemNFComponent';
 import NotificationListComponent from '../../../../../../../features/noticeitem/src/main/ets/com/ohos/noticeItem/view/NotificationListComponent';
 import NotificationViewModel from '../../../../../../../features/noticeitem/src/main/ets/com/ohos/noticeItem/viewmodel/NotificationViewModel';
 import ResourceUtil from '../../../../../../../common/src/main/ets/default/ResourceUtil';
@@ -147,42 +137,59 @@ export default struct Notification {
   }
 }
 
+// Panel's own status header — see the note on control.ets's statusBar struct.
+// Custom row (battery% + clock, white, sys.* resources only) drawn from
+// process-wide shared data; the shared icon components render blank in this HAP
+// because their `app.*` resources don't resolve here.
 @Component
 struct statusBar {
-  @StorageLink('StatusCoefficient') StatusCoefficient: number = 1.0
   private touchMoveCallback: Function = () => {}
   startX: number = 0
   startY: number = 0
   @State moveX: number = 0
   @State moveY: number = 0
+  @State mTime: string = ''
+  @StorageLink('batterySoc') batterySoc: number = 100
+  unSubscriber?: unsubscribe
+
+  aboutToAppear() {
+    this.unSubscriber = EventManager.subscribe(TIME_CHANGE_EVENT, (args: TimeEventArgs) => {
+      this.mTime = TimeManager.formatTime(args.date)
+    })
+    this.mTime = TimeManager.formatTime(new Date())
+  }
+
+  aboutToDisappear() {
+    this.unSubscriber && this.unSubscriber()
+    this.unSubscriber = undefined
+  }
 
   build() {
     Column(){
       Stack(){
+        // Content layer (rendered): right-aligned battery% + clock.
+        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.End }) {
+          Text(this.batterySoc + '%')
+            .fontColor('#FFFFFF')
+            .fontSize('16fp')
+            .fontWeight(FontWeight.Medium)
+            .margin({ right: 8 })
+          Text(this.mTime)
+            .fontColor('#FFFFFF')
+            .fontSize('16fp')
+            .fontWeight(FontWeight.Medium)
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: 16, right: 16 })
+        // Touch layer on top (transparent): left/right swipe-down switches panel.
         Row(){
           Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'left')})
           Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'right')})
         }.width('100%').height('100%')
-
-        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Center }) {
-          Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Start }) {
-            SignalIcon()
-            WifiIcon()
-          }
-
-          Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.End }) {
-            LocationIcon()
-            BluetoothIcon()
-            RingModeIcon()
-            if(isNfcAvailable()){
-              NfcIcon()
-            }
-            AirplaneIcon()
-            BatteryIcon()
-            ClockIcon()
-          }
-        }
       }
+      .width('100%')
+      .height('100%')
     }
     .height(deviceTypeInfo === 'phone' ? $r("app.float.phone_status_bar_height") : $r("app.float.status_bar_height"))
     .width('100%')

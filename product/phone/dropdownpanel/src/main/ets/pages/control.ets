@@ -13,19 +13,12 @@
  * limitations under the License.
  */
 
-import {isNfcAvailable} from '../../../../../../../common/src/main/ets/default/Constants';
 import AbilityManager from '../../../../../../../common/src/main/ets/default/abilitymanager/abilityManager';
 import ControlCenterComponent from '../../../../../../../features/controlcentercomponent/src/main/ets/com/ohos/pages/ControlCenterComponent'
-import BatteryIcon from '../../../../../../../features/batterycomponent/src/main/ets/default/pages/batteryIcon'
-import ClockIcon from '../../../../../../../features/clockcomponent/src/main/ets/default/pages/clockIcon'
-import AirplaneIcon from '../../../../../../../features/airplanecomponent/src/main/ets/default/pages/StatusBarIconItemAirplaneComponent'
-import WifiIcon from '../../../../../../../features/wificomponent/src/main/ets/default/pages/wifiIcon'
-import BluetoothIcon from '../../../../../../../features/bluetoothcomponent/src/main/ets/com/ohos/pages/StatusBarIconItemBluetoothComponent'
-import SignalIcon from '../../../../../../../features/signalcomponent/src/main/ets/default/pages/signalIcon'
-import LocationIcon from '../../../../../../../features/locationcomponent/src/main/ets/com/ohos/pages/StatusBarIconItemLocationComponent'
-import RingModeIcon from '../../../../../../../features/ringmodecomponent/src/main/ets/com/ohos/pages/StatusBarIconItemRingModeComponent'
-import NfcIcon from '../../../../../../../features/nfccomponent/src/main/ets/com/ohos/pages/StatusBarIconItemNFComponent'
 import Log from '../../../../../../../common/src/main/ets/default/Log'
+import TimeManager, { TimeEventArgs, TIME_CHANGE_EVENT
+} from '../../../../../../../common/src/main/ets/default/TimeManager'
+import EventManager, { unsubscribe } from '../../../../../../../common/src/main/ets/default/event/EventManager'
 import Constants from './common/constants'
 import StyleConfiguration, { ControlStyle } from './common/StyleConfiguration'
 import ControlCenterConfig from './common/ControlCenterConfig';
@@ -114,46 +107,66 @@ export default struct Control {
   }
 }
 
+// Panel's own status header. It does NOT reuse the shared status-bar icon
+// components (SignalIcon/WifiIcon/BatteryIcon/ClockIcon…): those reference
+// `app.*` resources (icon_component_opacity, glyph media) defined in their own
+// feature modules, which DON'T resolve when the structs are compiled into this
+// HAP via relative import → the icons render blank. Instead we draw a custom row
+// from process-wide shared data — the clock from TimeManager's TIME_CHANGE_EVENT
+// and the battery from AppStorage('batterySoc'), both populated by the real
+// status bar's models in the same systemui process — using only sys.*/explicit
+// resources. This is the single visible bar (the real one is suppressed by the
+// panel's setWindowSystemBarEnable([])). Clock/battery sit on the RIGHT to match
+// the real bar's cluster so there's no jump when the panel opens over it.
 @Component
 struct statusBar {
-  @StorageLink('StatusCoefficient') StatusCoefficient: number = 1.0
   private touchMoveCallback: Function = () => {}
   startX: number = 0
   startY: number = 0
   @State moveX: number = 0
   @State moveY: number = 0
+  @State mTime: string = ''
+  @StorageLink('batterySoc') batterySoc: number = 100
+  unSubscriber?: unsubscribe
+
+  aboutToAppear() {
+    this.unSubscriber = EventManager.subscribe(TIME_CHANGE_EVENT, (args: TimeEventArgs) => {
+      this.mTime = TimeManager.formatTime(args.date)
+    })
+    this.mTime = TimeManager.formatTime(new Date())
+  }
+
+  aboutToDisappear() {
+    this.unSubscriber && this.unSubscriber()
+    this.unSubscriber = undefined
+  }
 
   build() {
-    Column(){
-      Stack(){
-
-        Row(){
-          Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'left')})
-          Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'right')})
-        }.width('100%').height('100%')
-
-        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Center }) {
-          Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Start }) {
-            SignalIcon()
-            WifiIcon()
-          }
-
-          Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.End }) {
-            LocationIcon()
-            BluetoothIcon()
-            RingModeIcon()
-            if( isNfcAvailable() ){
-              NfcIcon()
-            }
-            AirplaneIcon()
-            BatteryIcon()
-            ClockIcon()
-          }
-        }
-        .width('100%')
-        .height('100%')
+    Stack(){
+      // Content layer (rendered): right-aligned battery% + clock, matching the
+      // real status bar's right cluster.
+      Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.End }) {
+        Text(this.batterySoc + '%')
+          .fontColor('#FFFFFF')
+          .fontSize('16fp')
+          .fontWeight(FontWeight.Medium)
+          .margin({ right: 8 })
+        Text(this.mTime)
+          .fontColor('#FFFFFF')
+          .fontSize('16fp')
+          .fontWeight(FontWeight.Medium)
       }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 16, right: 16 })
+      // Touch layer on top (transparent): left/right swipe-down switches panel.
+      Row(){
+        Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'left')})
+        Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'right')})
+      }.width('100%').height('100%')
     }
+    .width('100%')
+    .height('100%')
   }
 
   touchEvent(event: TouchEvent, touchLocation: string) {

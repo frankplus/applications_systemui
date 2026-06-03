@@ -23,6 +23,7 @@ import RingModeIcon from '../../../../../../../features/ringmodecomponent/src/ma
 
 import AbilityManager from '../../../../../../../common/src/main/ets/default/abilitymanager/abilityManager';
 import image from "@ohos.multimedia.image"
+import window from '@ohos.window'
 import Log from '../../../../../../../common/src/main/ets/default/Log'
 import Trace from '../../../../../../../common/src/main/ets/default/Trace'
 import WindowManager, { WindowType, WINDOW_SHOW_HIDE_EVENT
@@ -32,7 +33,6 @@ import { START_ABILITY_EVENT } from "../../../../../../../common/src/main/ets/de
 import CommonStyleManager from '../../../../../../../common/src/main/ets/default/CommonStyleManager'
 import MultimodalInputManager from '../../../../../../../common/src/main/ets/default/MultimodalInputManager'
 import HeightConfigUtils from '../../../../../../../common/src/main/ets/default/heightcofigUtils/HeightConfigUtils'
-import StatusBarVM from '../../../../../../../features/statusbarcomponent/src/main/ets/com/ohos/viewmodel/StatusBarVM'
 import NavigationEvent, { NavigationCallBack } from './common/navigationEvent'
 import Notification from './notification'
 import ControlCenterComponent from './control'
@@ -71,6 +71,14 @@ const SHOW_ANIM_CONFIG: AnimateParam = {
   playMode: PlayMode.Normal
 };
 
+// How long to keep the (off-screen) panel rendering after a close commits,
+// before tearing it down (panelActive=false). Must exceed the spring's visual
+// settle time so the panel slides ALL the way off the top edge instead of
+// vanishing ~one status-bar-height short. The spring (response 0.34s,
+// damping 0.82) settles well within this; the panel is already off-screen +
+// non-touchable for most of it, so an over-estimate is harmless.
+const PANEL_SETTLE_MS: number = 1200;
+
 enum DropdownPanelComponentName {
   NONE = 'None',
   CONTROL_CENTER = 'ControlCenter',
@@ -108,6 +116,24 @@ struct Index {
   @State mControlCenterDelete: TransitionOptions = {};
   @State componentOptAreaTranslateY: string = '0px';
   @State backgroundOpacity: number = 0;
+  // Drives whether the panel paints ANYTHING. The window is permanently shown
+  // (pre-shown in ServiceExtAbility to kill the cold-path open lag), so when the
+  // panel is closed it must render a fully-transparent surface — otherwise the
+  // always-present window would cover the screen. False at startup + after a
+  // close settles; true from open until the slide-out completes.
+  @State panelActive: boolean = false;
+  // Status-bar (top) and nav-bar (bottom) insets in px this window is laid out
+  // within. The legacy WMS lays the page content into the safe area (origin at
+  // y=topInset). We offset the panel up by topInset so its own header lands at
+  // screen y=0 (covers/substitutes the system status bar) and a full close
+  // translate (-H) carries the panel fully off the top edge; bottomInset grows
+  // the dim so it also covers the nav-bar strip. 0 until queried.
+  @State topInsetPx: number = 0;
+  @State bottomInsetPx: number = 0;
+  // Handle for the pending "deactivate after slide-out" timer (see _animateTo).
+  // Cleared on any reopen so a stale close can't tear down a freshly-opened
+  // panel. -1 means no timer pending.
+  private closeTimer: number = -1;
 
   onBackPress(): boolean {
     return true
@@ -115,6 +141,19 @@ struct Index {
 
   aboutToAppear() {
     Log.showInfo(TAG, `aboutToAppear, start`);
+    // Measure the system avoid insets so we can offset the panel up by the top
+    // inset (so its header lands at screen y=0) and grow the dim by both insets.
+    // Synchronous findWindow + avoid-area query — the window already exists
+    // (this page is loaded into it).
+    try {
+      let win = window.findWindow(WindowType.DROPDOWN_PANEL)
+      let area = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM)
+      this.topInsetPx = area.topRect.height
+      this.bottomInsetPx = area.bottomRect.height
+      Log.showInfo(TAG, `aboutToAppear, insets top=${this.topInsetPx} bottom=${this.bottomInsetPx}`)
+    } catch (e) {
+      Log.showWarn(TAG, `aboutToAppear, inset query failed: ${JSON.stringify(e)}`)
+    }
     // Establish a clean default for gesture-nav: the panel exists in the
     // tree but is not yet shown to the user.
     publishDropdownOpen(false)
@@ -128,7 +167,8 @@ struct Index {
     this.resizeDropdownPanelAndNavigationBar(dropdownRect, navigationBarRect);
     Log.showDebug(TAG, `getValueSync componentOptAreaHeightPX: ${this.componentOptAreaHeightPX}`);
 
-    this.componentOptAreaTranslateY = (-this.componentOptAreaHeightPX) + 'px';
+    // Initial state: fully off the top edge (H + topInset; see showSelf/hideSelf).
+    this.componentOptAreaTranslateY = (-(this.componentOptAreaHeightPX + this.topInsetPx)) + 'px';
 
     this.mClearCallbacks = [];
     this.mClearCallbacks.push(
@@ -173,7 +213,13 @@ struct Index {
     if (this.showComponentName === DropdownPanelComponentName.NONE) {
       return
     }
-    StatusBarVM.setUseInWindowName(WindowType.DROPDOWN_PANEL)
+    // NOTE: do NOT call StatusBarVM.setUseInWindowName(DROPDOWN_PANEL) here.
+    // There is one StatusBarVM singleton for the whole systemui process and that
+    // call forces every status-bar icon's tint to #FFFFFFFF globally
+    // (changeComponentContent gate). The panel renders its OWN status header
+    // (control.ets/notification.ets) with explicit colours, so it doesn't need
+    // the shared tint, and leaving the owner as STATUS_BAR keeps the real bar
+    // tinted correctly.
     Trace.end(Trace.CORE_METHOD_START_DROPDOWNPANEL)
   }
 
@@ -292,15 +338,39 @@ struct Index {
     })
   }
 
+  // ----- Perma-shown window helpers -----
+  // The panel window is shown ONCE at init (ServiceExtAbility pre-shows it) and
+  // never hidden again. Opening just makes it touchable + starts rendering;
+  // closing makes it non-touchable + stops rendering. This dodges (a) the ~1 s
+  // cold-path lag of showWindow() after a foreground transition, and (b) the
+  // RenderService surface teardown on hide() that tripped the Mali NULL+0x1d8
+  // crash in RSRenderThread on every close. The real STATUS_BAR window is left
+  // untouched — setWindowSystemBarEnable([]) (ServiceExtAbility) suppresses it
+  // while the panel is foreground, so no expensive STATUS_BAR show/hide.
+  private activatePanelWindow() {
+    this.panelActive = true
+    WindowManager.setWindowTouchable(WindowType.DROPDOWN_PANEL, true)
+  }
+
+  private cancelPendingClose() {
+    if (this.closeTimer >= 0) {
+      clearTimeout(this.closeTimer)
+      this.closeTimer = -1
+    }
+  }
+
   showSelf(showComponentName: DropdownPanelComponentName) {
     Log.showInfo(TAG, `showSelf, showComponentName: ${showComponentName}, currentY=${this.componentOptAreaTranslateY}`)
-    // Force the panel off-screen BEFORE the window paints so animateTo has a
-    // valid "from" state to animate from.
-    this.componentOptAreaTranslateY = (-this.componentOptAreaHeightPX) + 'px'
+    this.cancelPendingClose()
+    // Force the panel fully off the top edge BEFORE it paints so animateTo has a
+    // valid "from" state. Off-screen distance is H + topInset (the panel is
+    // topInset taller than the body and offset up by topInset), otherwise it
+    // would start ~one status-bar-height short and pop in.
+    this.componentOptAreaTranslateY = (-(this.componentOptAreaHeightPX + this.topInsetPx)) + 'px'
     this.backgroundOpacity = 0
     this.showComponentName = showComponentName
     publishDropdownOpen(true)
-    WindowManager.showWindow(WindowType.DROPDOWN_PANEL)
+    this.activatePanelWindow()
     Trace.start(Trace.CORE_METHOD_START_DROPDOWNPANEL)
     // Defer to next tick so the window finishes its first paint at -H before
     // the spring animation kicks the translate to 0.
@@ -328,13 +398,17 @@ struct Index {
       : DropdownPanelComponentName.CONTROL_CENTER
     const H = this.componentOptAreaHeightPX
     const dy = args.dy ?? 0
-    // Open the window if not already, render content at finger-tracked offset.
+    // Render content at finger-tracked offset.
+    this.cancelPendingClose()
     this.dragActive = true
     this.componentOptAreaTranslateY = (-H + Math.min(dy, H)) + 'px'
     this.backgroundOpacity = Math.min(dy / H, 1)
     this.showComponentName = area
     publishDropdownOpen(true)
-    WindowManager.showWindow(WindowType.DROPDOWN_PANEL)
+    // Perma-shown window: activate (touchable + start rendering) instead of
+    // showWindow(). A mid-drag show used to steal the status bar's in-flight
+    // touch and strand the pull halfway down (the "stuck in the middle" bug).
+    this.activatePanelWindow()
   }
 
   onPanelDragUpdate(args: DragArg) {
@@ -370,11 +444,19 @@ struct Index {
       Log.showInfo(TAG, `hideSelf, hide anim finish.`);
     };
     // Clear the gesture-nav suspend flag synchronously: the panel is no
-    // longer the user's intent target the moment hideSelf is called,
-    // even though the slide-out animation still has ~450 ms to play.
+    // longer the user's intent target the moment hideSelf is called.
     publishDropdownOpen(false)
+    // Stop capturing touches immediately — the panel is closing, so taps should
+    // fall through to the app during the slide-out. panelActive stays true so
+    // the panel keeps RENDERING as it slides all the way off the top edge; it's
+    // torn down only after the spring settles (see _animateTo).
+    WindowManager.setWindowTouchable(WindowType.DROPDOWN_PANEL, false)
     this._animateTo(SHOW_ANIM_CONFIG, () => {
-      this.componentOptAreaTranslateY = (-this.componentOptAreaHeightPX) + 'px'
+      // Slide the panel FULLY off the top edge (H + topInset, not just H) so its
+      // bottom clears y=0 — otherwise it stops ~one status-bar-height short,
+      // leaving a teal strip that lingers until panelActive flips (the
+      // "stops at the line and then vanishes" glitch).
+      this.componentOptAreaTranslateY = (-(this.componentOptAreaHeightPX + this.topInsetPx)) + 'px'
       this.backgroundOpacity = 0
       this.showComponentName = DropdownPanelComponentName.NONE
     }, true)
@@ -384,8 +466,18 @@ struct Index {
     Log.showDebug(TAG, `_animateTo, config: ${JSON.stringify(config)}`)
     animateTo(config, callback)
     if (ishideWindow) {
-      const delay = Number(config.duration) + Number(config.delay)
-      setTimeout(() => WindowManager.hideWindow(WindowType.DROPDOWN_PANEL), delay)
+      // Tear the panel down (stop rendering) only AFTER the close spring has
+      // fully settled, so it slides ALL the way off the top edge instead of
+      // vanishing ~one status-bar-height short. The window stays shown (no
+      // hide() → no cold-path reopen lag, no Mali RSRenderThread teardown crash,
+      // Bug 8.17); panelActive=false just makes the off-screen surface paint
+      // nothing. Cancelable so a reopen mid-slide doesn't tear down the reopened
+      // panel. Touchability was already dropped in hideSelf.
+      this.cancelPendingClose()
+      this.closeTimer = setTimeout(() => {
+        this.closeTimer = -1
+        this.panelActive = false
+      }, PANEL_SETTLE_MS)
     }
   }
 
@@ -399,40 +491,73 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.Top }) {
-      // Dim overlay over the content below. Opacity tracks pull progress
-      // (backgroundOpacity is 0..1, driven by onPanelDragUpdate/showSelf).
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(`rgba(0,0,0,${0.45 * this.backgroundOpacity})`)
-      // Panel container — the bg image is INSIDE so it slides with the panel
-      // instead of appearing as a full-screen flash.
-      Stack({ alignContent: Alignment.TopStart }) {
-        Image($r("app.media.dropdownpanel_bgc"))
+      // Everything inside is gated on `panelActive`: the window is permanently
+      // shown, so when the panel is closed it must paint a fully-transparent
+      // surface (render nothing) — otherwise the always-present window would
+      // cover the screen below.
+      if (this.panelActive) {
+        // Dim overlay over the content below. Opacity tracks pull progress
+        // (backgroundOpacity is 0..1, driven by onPanelDragUpdate/showSelf).
+        // Grown by both insets and lifted by the top inset so it dims the whole
+        // screen including the status-bar strip above the safe area.
+        Column()
+          .width('100%')
+          .height(`calc(100% + ${this.topInsetPx + this.bottomInsetPx}px)`)
+          .offset({ y: -this.topInsetPx })
+          .backgroundColor(`rgba(0,0,0,${0.45 * this.backgroundOpacity})`)
+        // Panel container — the bg image is INSIDE so it slides with the panel
+        // instead of appearing as a full-screen flash.
+        Stack({ alignContent: Alignment.TopStart }) {
+          // Full-bleed background: NO top padding, so the blurred bg fills the
+          // whole panel including the status-bar strip (y=0..topInset), covering
+          // the system status bar so it isn't a second visible bar.
+          Image($r("app.media.dropdownpanel_bgc"))
+            .width('100%')
+            .height('100%')
+            .objectFit(ImageFit.Fill)
+            .blur(25)
+          Column() {
+            if (this.showComponentName === DropdownPanelComponentName.NOTIFICATION) {
+              Notification({ touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data) })
+                .transition(this.mNotificationInsert)
+                .transition(this.mNotificationDelete)
+            }
+            if (this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER) {
+              ControlCenterComponent({
+                touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data)
+              })
+                .transition(this.mControlCenterInsert)
+                .transition(this.mControlCenterDelete)
+            }
+          }
           .width('100%')
           .height('100%')
-          .objectFit(ImageFit.Fill)
-          .blur(25)
-        Column() {
-          if (this.showComponentName === DropdownPanelComponentName.NOTIFICATION) {
-            Notification({ touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data) })
-              .transition(this.mNotificationInsert)
-              .transition(this.mNotificationDelete)
-          }
-          if (this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER) {
-            ControlCenterComponent({
-              touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data)
-            })
-              .transition(this.mControlCenterInsert)
-              .transition(this.mControlCenterDelete)
-          }
+          // Push the panel CONTENT (its own status header + body) down so it clears
+          // the status-bar avoid line. The legacy WMS clips panel foreground content
+          // to the safe area (origin at the status-bar inset) — confirmed on device
+          // (2026-06-03): with no padding the header renders ABOVE the line and is
+          // clipped away, while the full-bleed bg Image still overflows up to y=0
+          // (an immersive background is allowed under the status bar; foreground
+          // text is not — this holds with OR without setWindowSystemBarEnable([]),
+          // so a custom header CANNOT reach true y=0 where the real icons sit
+          // without a window_manager source patch). We pad by (topInset - 12vp)
+          // instead of the full inset so the header rides right up against that line
+          // (≈5px margin) rather than floating a status-bar-height below it; the
+          // matching .offset below keeps the bg covering the whole strip.
+          .padding({ top: this.topInsetPx - 12 })
         }
         .width('100%')
-        .height('100%')
+        // Height = body height + top inset: the extra topInset compensates for
+        // the -topInset offset below so the panel's bottom still meets the nav
+        // bar (no gap), while its top reaches screen y=0.
+        .height((this.componentOptAreaHeightPX + this.topInsetPx) + 'px')
+        .translate({ y: this.componentOptAreaTranslateY })
+        // Lift the whole panel up by the top inset so its background reaches
+        // screen y=0 (covering the system status bar) and a full close-translate
+        // (translateY = -H) carries it fully off the top edge. The content's
+        // matching top padding keeps the header on-screen at y=0.
+        .offset({ y: -this.topInsetPx })
       }
-      .width('100%')
-      .height(this.componentOptAreaHeightPX + 'px')
-      .translate({ y: this.componentOptAreaTranslateY })
     }
     .width('100%')
     .height('100%')
