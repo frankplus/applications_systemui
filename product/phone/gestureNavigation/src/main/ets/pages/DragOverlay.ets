@@ -69,6 +69,13 @@ struct DragOverlay {
   @StorageLink('OniroDragSnap') snap: image.PixelMap | null = null;
   @StorageLink('OniroDragWallpaper') wallpaper: image.PixelMap | null = null;
   @StorageLink('OniroDragRecents') recents: RecentsCardData[] = [];
+  // Mission id of the foreground app shown by the live snapshot card.
+  // -1 ⇒ launcher/systemui foreground (no × offered). Set by RecentsLoader.
+  @StorageLink('OniroDragForegroundMid') foregroundMid: number = -1;
+  // True when the gesture started on the launcher: there's no foreground
+  // app to peel, so the captured (launcher) snapshot card is NOT rendered —
+  // the Overview shows only the app recents. Set by the service at start.
+  @StorageLink('OniroDragFromLauncher') fromLauncher: boolean = false;
 
   // Per-frame transforms.
   @StorageLink('OniroDragRowLeftVp') rowLeftVp: number = 0;
@@ -169,7 +176,13 @@ struct DragOverlay {
   }
 
   private returnToForeground(): void {
-    console.log(`${TAG} returnToForeground`);
+    console.log(`${TAG} returnToForeground fromLauncher=${this.fromLauncher}`);
+    if (this.fromLauncher) {
+      // No foreground card to grow back into — we came from the launcher,
+      // so just dismiss the Overview and reveal it again.
+      this.hideWindow();
+      return;
+    }
     this.expandToCard(this.recents.length, (): void => this.hideWindow());
   }
 
@@ -220,6 +233,33 @@ struct DragOverlay {
       })
       .catch((e: object): void => {
         console.error(`${TAG} clearMission failed: ${JSON.stringify(e)}`);
+      });
+  }
+
+  /**
+   * Dismiss the FOREGROUND app (the live-snapshot card). Unlike a
+   * background recent — which just drops out of the still-open Overview
+   * — killing the current app leaves nothing to keep the switcher
+   * anchored on (the row geometry + tap-to-return are built around the
+   * foreground card), so we tear the overlay down via hideWindow(). The
+   * killed mission is gone, so WMS surfaces whatever is behind it (the
+   * next app, or the launcher). hideWindow() is the same teardown path
+   * the backdrop / tap-to-return uses, so the service reverts the window
+   * to non-touchable exactly as it does there.
+   */
+  private clearForeground(): void {
+    const mid = this.foregroundMid;
+    console.log(`${TAG} clear foreground mid=${mid}`);
+    if (mid < 0) {
+      // Foreground is launcher/systemui — nothing to kill; just return.
+      this.returnToForeground();
+      return;
+    }
+    missionManager.clearMission(mid)
+      .then((): void => this.hideWindow())
+      .catch((e: object): void => {
+        console.error(`${TAG} clear foreground failed: ${JSON.stringify(e)}`);
+        this.hideWindow();
       });
   }
 
@@ -321,22 +361,47 @@ struct DragOverlay {
             // smooth card-grows-back-into-app transition since the
             // snapshot already shows that exact foreground app.
             //
-            // .animation() AFTER .opacity() so the commit-spring
-            // (HOME → al=0, CANCEL → al=1) animates instead of
-            // snapping. Without this, alpha jumps instantly to the
-            // target and the user sees the card vanish at gesture-
-            // release instead of fading with the scale animation.
-            Image(this.snap)
-              .width(this.cardWidthVp)
-              .height(this.cardHeightVp)
-              .borderRadius(this.rad)
-              .clip(true)
-              .objectFit(ImageFit.Cover)
-              .opacity(this.al)
-              .animation({ curve: curves.springMotion(0.34, 0.82) })
-              .onClick(() => {
-                if (this.recentsMode) this.returnToForeground();
-              });
+            // Skipped entirely when the gesture began on the launcher:
+            // the captured snapshot is the home screen, which we never
+            // show as a recents card (the row is the recents only).
+            //
+            // Wrapped in a Stack so the × close button is a SIBLING of
+            // the Image (not a descendant) — otherwise its onClick would
+            // bubble up to the return-to-foreground tap. The opacity +
+            // .animation() live on the Stack (.animation() AFTER
+            // .opacity()) so the commit-spring (HOME → al=0, CANCEL →
+            // al=1) animates the whole card instead of snapping;
+            // without it the card would vanish at gesture-release
+            // instead of fading with the scale animation.
+            if (!this.fromLauncher) {
+            Stack({ alignContent: Alignment.TopEnd }) {
+              Image(this.snap)
+                .width(this.cardWidthVp)
+                .height(this.cardHeightVp)
+                .borderRadius(this.rad)
+                .clip(true)
+                .objectFit(ImageFit.Cover)
+                .onClick(() => {
+                  if (this.recentsMode) this.returnToForeground();
+                });
+              // The foreground app is dismissible too (parity with the
+              // recents cards). Only in recents mode, and only when we
+              // know a real foreground mission to kill (foregroundMid≥0).
+              if (this.recentsMode && this.foregroundMid >= 0) {
+                Text('×')
+                  .fontSize(28).fontColor(Color.White).fontWeight(FontWeight.Bold)
+                  .textAlign(TextAlign.Center)
+                  .width(40).height(40).borderRadius(20)
+                  .backgroundColor('#88000000')
+                  .margin({ top: 16, right: 16 })
+                  .onClick(() => this.clearForeground());
+              }
+            }
+            .width(this.cardWidthVp)
+            .height(this.cardHeightVp)
+            .opacity(this.al)
+            .animation({ curve: curves.springMotion(0.34, 0.82) });
+            }
           }
           .width(this.rowWidthVp)
           .height(this.rowHeightVp)

@@ -80,6 +80,12 @@ const KEYCODE_BACK = 2;
 // the home screen, and a side swipe there should reach the launcher
 // untouched (e.g. its own page switching).
 const LAUNCHER_BUNDLE = 'com.ohos.launcher';
+// Our own bundle. When one of our windows (the drag Overview, dropdown
+// panel, volume, …) is the top ability, getTopAbility() reports us — which
+// says nothing about the underlying app. We must NOT let that overwrite the
+// cached launcher state, or a second swipe right after the Overview closes
+// reads a stale "not launcher" and wrongly shows the home screen as a card.
+const SYSTEMUI_BUNDLE = 'com.ohos.systemui';
 // Throttle for the self-healing getTopAbility() re-query on touch DOWN.
 const FG_CHECK_THROTTLE_MS = 1500;
 
@@ -311,12 +317,18 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       onTrackingStart: (_sx: number, _sy: number) => {
         Log.showDebug(TAG, 'recognizer: tracking start (slop passed)');
         this.resetOverlayForGesture();
+        // Starting on the launcher? Then there's no foreground app to peel:
+        // the captured snapshot is the home screen, which we never show as a
+        // card. The row is the recents only, centered on the most-recent.
+        const fromLauncher = this.foregroundIsLauncher;
+        AppStorage.SetOrCreate('OniroDragFromLauncher', fromLauncher);
+        this.dragController?.setHasForegroundCard(!fromLauncher);
         this.dragController?.start();
         // Kick off the recents fetch IN PARALLEL with the snapshot
         // — both can take 100-300 ms but the snapshot blocks the
         // overlay-show. Once recents resolve, push the count into
         // the controller so the row width / scale anchor refresh.
-        this.recentsLoader.load().then(() => {
+        this.recentsLoader.load(fromLauncher).then(() => {
           this.dragController?.setRecentsCount(this.recentsLoader.count());
         });
         // Show the overlay only after the snapshot is ready — every
@@ -417,6 +429,11 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     this.lastForegroundCheckMs = Date.now();
     abilityManager.getTopAbility().then((top) => {
       const b: string = top?.bundleName ?? '';
+      // Ignore our own windows (Overview/panels) and empty reads — they
+      // don't reflect the underlying foreground app. Keep the last value.
+      if (b === SYSTEMUI_BUNDLE || b === '') {
+        return;
+      }
       const isLauncher = b === LAUNCHER_BUNDLE;
       if (isLauncher !== this.foregroundIsLauncher) {
         this.foregroundIsLauncher = isLauncher;

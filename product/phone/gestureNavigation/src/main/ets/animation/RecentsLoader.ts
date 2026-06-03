@@ -21,6 +21,10 @@ import Log from '../../../../../../../common/src/main/ets/default/Log';
 const TAG = 'GestureNavigation_RecentsLoader';
 
 export const APP_KEY_DRAG_RECENTS = 'OniroDragRecents';
+// Mission id of the current foreground app (the one the live snapshot
+// shows). -1 when the foreground is the launcher/systemui — i.e. there's
+// nothing the user should be able to kill from the foreground card.
+export const APP_KEY_DRAG_FOREGROUND_MID = 'OniroDragForegroundMid';
 
 const MAX_RECENTS = 5;
 const EXCLUDED_BUNDLES = new Set<string>([
@@ -48,20 +52,31 @@ export class RecentsLoader {
    * resulting array is the most-recent BACKGROUND app, rendered
    * closest to the foreground card in the row.
    */
-  async load(): Promise<void> {
+  async load(foregroundIsLauncher: boolean = false): Promise<void> {
     if (this.inFlight) return;
     this.inFlight = true;
     const t0 = Date.now();
     try {
       const missions = await missionManager.getMissionInfos('', MAX_RECENTS + 4);
-      // Drop foreground (first non-launcher entry) + excluded bundles.
-      let foregroundSeen = false;
+      // Normally the first non-excluded mission is the current foreground
+      // app — its live screenshot is the foreground card, so drop it from
+      // the recents row and record its id so the overlay can offer a close
+      // (×) on the foreground card too.
+      //
+      // EXCEPTION: when the launcher is the foreground, its live screenshot
+      // is the (non-killable) launcher, while the top NORMAL mission is a
+      // real BACKGROUND app. Seeding foregroundSeen=true keeps that app in
+      // the row and leaves foregroundMid=-1, so the launcher card offers no
+      // × (and we never kill a background app the user can't even see).
+      AppStorage.SetOrCreate(APP_KEY_DRAG_FOREGROUND_MID, -1);
+      let foregroundSeen = foregroundIsLauncher;
       const candidates: missionManager.MissionInfo[] = [];
       for (const m of missions) {
         const b: string = m.want?.bundleName ?? '';
         if (EXCLUDED_BUNDLES.has(b)) continue;
         if (!foregroundSeen) {
           foregroundSeen = true;
+          AppStorage.SetOrCreate(APP_KEY_DRAG_FOREGROUND_MID, m.missionId);
           continue;
         }
         candidates.push(m);
@@ -114,5 +129,6 @@ export class RecentsLoader {
     }
     this.cached = [];
     AppStorage.SetOrCreate(APP_KEY_DRAG_RECENTS, [] as RecentsCardData[]);
+    AppStorage.SetOrCreate(APP_KEY_DRAG_FOREGROUND_MID, -1);
   }
 }

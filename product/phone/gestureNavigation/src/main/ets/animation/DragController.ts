@@ -124,6 +124,11 @@ export class DragController {
   private screenWidthVp: number;
   private screenHeightVp: number;
   private recentsCount: number = 0;
+  // Whether the row includes a captured-foreground card on its right end.
+  // True for the normal app→Overview swipe; false when swiping up FROM the
+  // launcher (no app to peel — the row is purely the recents, centered on
+  // the most-recent one, and the launcher is never shown as a card).
+  private hasForegroundCard: boolean = true;
   private tickCount = 0;
 
   constructor(cfg: DragControllerConfig) {
@@ -131,6 +136,30 @@ export class DragController {
     this.screenHeightVp = cfg.screenHeightPx / cfg.vpToPx;
     this.screenWidthVp = cfg.screenWidthPx / cfg.vpToPx;
     this.dragLengthVp = this.screenHeightVp * DRAG_LENGTH_FRACTION;
+  }
+
+  /**
+   * Toggle whether the row carries a foreground (captured-app) card.
+   * Called at gesture start, before start()/setRecentsCount, so all
+   * geometry computed from there uses the right card count. False when
+   * the gesture begins on the launcher.
+   */
+  setHasForegroundCard(v: boolean): void {
+    this.hasForegroundCard = v;
+    Log.showInfo(TAG, `setHasForegroundCard=${v}`);
+  }
+
+  // Total cards in the row = recents + (foreground card, if any).
+  private cardCount(): number {
+    return this.recentsCount + (this.hasForegroundCard ? 1 : 0);
+  }
+
+  // Row width for the current card count. Guards the empty case so the
+  // (n-1) spacing term can't go negative.
+  private rowWidthVp(): number {
+    const n = this.cardCount();
+    if (n <= 0) return this.screenWidthVp;
+    return n * this.screenWidthVp + (n - 1) * CARD_SPACING_VP;
   }
 
   /**
@@ -314,9 +343,11 @@ export class DragController {
   private writeStaticGeometry(): void {
     const cardW = this.screenWidthVp;
     const cardH = this.screenHeightVp;
-    const rowW = (this.recentsCount + 1) * cardW + this.recentsCount * CARD_SPACING_VP;
+    const rowW = this.rowWidthVp();
     const rowH = cardH;
-    // Scale fixed point = foreground card BOTTOM-CENTER in row coords.
+    // Scale fixed point = RIGHTMOST card's BOTTOM-CENTER in row coords.
+    // That's the foreground card when present, otherwise the most-recent
+    // recent (which is the card that ends up centered in the Overview).
     const anchorX = rowW - cardW / 2;
     const anchorY = cardH;
     AppStorage.SetOrCreate(APP_KEY_DRAG_CARD_WIDTH, cardW);
@@ -333,7 +364,7 @@ export class DragController {
   private writePosition(targetCenterXVp: number, targetBottomYVp: number): void {
     const cardW = this.screenWidthVp;
     const cardH = this.screenHeightVp;
-    const rowW = (this.recentsCount + 1) * cardW + this.recentsCount * CARD_SPACING_VP;
+    const rowW = this.rowWidthVp();
     const anchorX = rowW - cardW / 2;
     // posX + anchorX = targetCenterX  →  posX = targetCenterX - anchorX
     // posY + anchorY = targetBottomY  →  posY = targetBottomY - cardH
