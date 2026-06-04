@@ -80,14 +80,16 @@ const KEYCODE_BACK = 2;
 // the home screen, and a side swipe there should reach the launcher
 // untouched (e.g. its own page switching).
 const LAUNCHER_BUNDLE = 'com.ohos.launcher';
-// Our own bundle. When one of our windows (the drag Overview, dropdown
-// panel, volume, …) is the top ability, getTopAbility() reports us — which
-// says nothing about the underlying app. We must NOT let that overwrite the
-// cached launcher state, or a second swipe right after the Overview closes
-// reads a stale "not launcher" and wrongly shows the home screen as a card.
+// Our own bundle. Defensive guard so a systemui fg event (or the
+// getTopAbility seed catching one of our own overlays) never overwrites the
+// cached launcher state.
 const SYSTEMUI_BUNDLE = 'com.ohos.systemui';
-// Throttle for the self-healing getTopAbility() re-query on touch DOWN.
-const FG_CHECK_THROTTLE_MS = 1500;
+// appmgr AbilityState values (app_mgr_constants.h: CREATE=0, READY=1,
+// FOREGROUND=2, FOCUS=3, BACKGROUND=4). These are the values carried in
+// AbilityStateData.state by the abilityForegroundState observer — NOT the JS
+// abilityManager.AbilityState enum (where FOREGROUND=9). Verified on device:
+// state=2 fires when an app foregrounds; state=4 when one backgrounds.
+const ABILITY_STATE_FOREGROUND = 2;
 
 const NAV_MODE_GESTURE = '0';
 const NAV_MODE_URI =
@@ -165,16 +167,27 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   private backPilfered = false;
 
   // Cached "is the launcher the current foreground app" flag, read
-  // synchronously at touch-DOWN to gate the side-edge BACK gesture. The
-  // launcher is NOT a normal mission on this platform (it lives in a
-  // separate, empty LAUNCHER mission list that getMissionInfos never
-  // reports), so the foreground app is read via abilityManager.getTopAbility()
-  // (systemapi, no permission needed). Kept fresh reactively by WMS's
-  // systemBarTintChange event (fires on foreground-window changes), plus a
-  // throttled re-query on touch DOWN as a self-healing fallback.
+  // synchronously at touch-DOWN to gate the side-edge BACK gesture. Set false
+  // whenever an app reaches FOREGROUND (the abilityForegroundState observer,
+  // below) and true optimistically by goHome(). We deliberately do NOT detect
+  // the launcher coming foreground from the observer: the launcher is silent
+  // on it, and inferring "home" from an app's BACKGROUND stuck this flag true
+  // inside apps (an app can background then regain focus with no fresh
+  // FOREGROUND event — warm refocus, the winanim remote-animation churn),
+  // which silently suppressed BACK. Biased toward false (BACK enabled): worst
+  // case is a harmless BACK on the home screen, never a dead BACK in an app.
   private foregroundIsLauncher = false;
-  private tintChangeCb = (_state) => this.refreshForegroundIsLauncher();
-  private lastForegroundCheckMs = 0;
+  // Push-based foreground tracking. abilityManager fires onAbilityStateChanged
+  // on every app ability FOREGROUND/BACKGROUND lifecycle transition. Replaces
+  // the old systemBarTintChange→getTopAbility pull, which
+  // did a SYNC binder on the main thread on every tint change and, on a hot
+  // reopen, blocked the whole systemui main thread ~1.2 s behind the winanim
+  // controller's remote animation — freezing the status-bar frame AND these
+  // very gesture callbacks. This observer's callback only sets a boolean (no
+  // IPC), so it can never block.
+  private fgObserver = {
+    onAbilityStateChanged: (data) => this.onAbilityForegroundState(data),
+  };
 
   private dragWindow: window.Window | null = null;
   private dragShown = false;
@@ -284,9 +297,9 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       this.backWindow = null;
     }
     try {
-      window.off('systemBarTintChange', this.tintChangeCb);
+      abilityManager.off('abilityForegroundState', this.fgObserver);
     } catch (e) {
-      Log.showWarn(TAG, `systemBarTintChange off failed: ${JSON.stringify(e)}`);
+      Log.showWarn(TAG, `abilityForegroundState off failed: ${JSON.stringify(e)}`);
     }
     this.wallpaperCache.stop();
     this.snapshotCapture.clear();
@@ -404,18 +417,21 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
   // ---- Foreground-app (launcher) tracking ------------------------------
 
   /**
-   * Subscribe to WMS's systemBarTintChange (fires when the foreground
-   * window changes — the launcher and apps apply different system-bar
-   * styles) and do an initial foreground read. systemui's TintStateManager
-   * already relies on this same event for status-bar tinting.
+   * Register the abilityForegroundState push observer (fires on every
+   * ability foreground/background transition, incl. the launcher) and do a
+   * one-time initial foreground read to seed the flag. Replaces the old
+   * systemBarTintChange→getTopAbility pull that blocked the main thread.
    */
   private initForegroundTracking(): void {
     try {
-      window.on('systemBarTintChange', this.tintChangeCb);
-      Log.showInfo(TAG, 'systemBarTintChange subscribed (launcher tracking)');
+      abilityManager.on('abilityForegroundState', this.fgObserver);
+      Log.showInfo(TAG, 'abilityForegroundState observer registered (launcher tracking)');
     } catch (e) {
-      Log.showError(TAG, `systemBarTintChange subscribe failed: ${JSON.stringify(e)}`);
+      Log.showError(TAG, `abilityForegroundState on failed: ${JSON.stringify(e)}`);
     }
+    // One-time seed: the observer only fires on CHANGES, so read the current
+    // foreground once at service start. Safe here — no transition is in
+    // flight at service start, so this single getTopAbility won't block.
     this.refreshForegroundIsLauncher();
   }
 
@@ -426,7 +442,6 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
    * a queryable mission). Only logs on a state change.
    */
   private refreshForegroundIsLauncher(): void {
-    this.lastForegroundCheckMs = Date.now();
     abilityManager.getTopAbility().then((top) => {
       const b: string = top?.bundleName ?? '';
       // Ignore our own windows (Overview/panels) and empty reads — they
@@ -434,14 +449,39 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
       if (b === SYSTEMUI_BUNDLE || b === '') {
         return;
       }
-      const isLauncher = b === LAUNCHER_BUNDLE;
-      if (isLauncher !== this.foregroundIsLauncher) {
-        this.foregroundIsLauncher = isLauncher;
-        Log.showInfo(TAG, `foregroundIsLauncher -> ${isLauncher} (top=${b})`);
-      }
+      this.setForegroundIsLauncher(b === LAUNCHER_BUNDLE, `seed top=${b}`);
     }).catch((e) => {
       Log.showWarn(TAG, `getTopAbility failed: ${JSON.stringify(e)}`);
     });
+  }
+
+  /**
+   * abilityForegroundState observer callback. We act ONLY on an app reaching
+   * FOREGROUND (that bundle is unambiguously the new top → BACK enabled).
+   * BACKGROUND is ignored on purpose: an app can background then regain focus
+   * with no fresh FOREGROUND event, so inferring "home" from a background
+   * stuck foregroundIsLauncher=true inside apps and killed BACK. Returning to
+   * the launcher is handled optimistically by goHome() instead. Pure boolean
+   * update, no IPC, so it can never block the main thread — the whole point of
+   * this rewrite, replacing the systemBarTintChange→getTopAbility sync pull.
+   */
+  private onAbilityForegroundState(data): void {
+    const b: string = data?.bundleName ?? '';
+    const st = data?.state;
+    Log.showDebug(TAG, `fgState raw: bundle=${b} state=${st}`);
+    if (b === '' || b === SYSTEMUI_BUNDLE) {
+      return;
+    }
+    if (st === ABILITY_STATE_FOREGROUND) {
+      this.setForegroundIsLauncher(b === LAUNCHER_BUNDLE, `fg=${b}`);
+    }
+  }
+
+  private setForegroundIsLauncher(isLauncher: boolean, why: string): void {
+    if (isLauncher !== this.foregroundIsLauncher) {
+      this.foregroundIsLauncher = isLauncher;
+      Log.showInfo(TAG, `foregroundIsLauncher -> ${isLauncher} (${why})`);
+    }
   }
 
   // ---- Input monitor ---------------------------------------------------
@@ -521,13 +561,11 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     if (this.checkAndSetPerationType() === PanGestureType.GAME_OPERATE) return false;
 
     if (action === TOUCH_DOWN) {
-      // Self-healing fallback for the launcher flag: if systemBarTintChange
-      // ever missed a foreground transition, re-query here (throttled).
-      // Async, so it corrects the NEXT gesture — the reactive event +
-      // goHome() optimistic set cover the immediate case.
-      if (Date.now() - this.lastForegroundCheckMs > FG_CHECK_THROTTLE_MS) {
-        this.refreshForegroundIsLauncher();
-      }
+      // foregroundIsLauncher is kept fresh by the abilityForegroundState
+      // observer (+ goHome's optimistic set). We deliberately do NOT call
+      // getTopAbility() here: it runs a SYNC binder on the main thread that,
+      // during a transition, blocks the whole gesture pipeline ~1.2 s — the
+      // exact bug this path used to cause.
       // Side-edge BACK takes priority on the left/right edge strips, but
       // only ABOVE the bottom HOME/RECENTS hot zone so the bottom-corner
       // overlap stays with the home gesture, and NOT while the launcher

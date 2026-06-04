@@ -29,7 +29,8 @@
         "type": "service",
         "permissions": [
           "ohos.permission.CAPTURE_SCREEN",
-          "ohos.permission.GET_WALLPAPER"
+          "ohos.permission.GET_WALLPAPER",
+          "ohos.permission.RUNNING_STATE_OBSERVER"
         ]
       }
     ],
@@ -39,6 +40,9 @@
       },
       {
         "name": "ohos.permission.GET_WALLPAPER"
+      },
+      {
+        "name": "ohos.permission.RUNNING_STATE_OBSERVER"
       }
     ]
   }
