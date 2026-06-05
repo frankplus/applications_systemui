@@ -26,23 +26,7 @@
         "icon": "$media:icon",
         "description": "$string:mainability_description",
         "label": "$string:app_name",
-        "type": "service",
-        "permissions": [
-          "ohos.permission.CAPTURE_SCREEN",
-          "ohos.permission.GET_WALLPAPER",
-          "ohos.permission.RUNNING_STATE_OBSERVER"
-        ]
-      }
-    ],
-    "requestPermissions": [
-      {
-        "name": "ohos.permission.CAPTURE_SCREEN"
-      },
-      {
-        "name": "ohos.permission.GET_WALLPAPER"
-      },
-      {
-        "name": "ohos.permission.RUNNING_STATE_OBSERVER"
+        "type": "service"
       }
     ]
   }

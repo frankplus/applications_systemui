@@ -1,7 +1,5 @@
 {
   "src": [
-    "pages/RecentsOverlay",
-    "pages/DragOverlay",
     "pages/BackPanel"
   ]
 }

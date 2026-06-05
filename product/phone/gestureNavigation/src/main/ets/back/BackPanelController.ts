@@ -46,7 +46,7 @@
 
 import Log from '../../../../../../../common/src/main/ets/default/Log';
 import vibrator from '@ohos.vibrator';
-import { VelocityTracker } from '../recognizer/VelocityTracker';
+import { VelocityTracker } from './VelocityTracker';
 import {
   AnimatedFloat, SpringForce, AnimationEndListener,
   MIN_VISIBLE_CHANGE_PIXELS, MIN_VISIBLE_CHANGE_ROTATION_DEGREES,
