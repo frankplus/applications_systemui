@@ -64,6 +64,16 @@ const NAV_MODE_URI =
   'datashare:///com.ohos.settingsdata/entry/settingsdata/SETTINGSDATA?Proxy=true&key=' +
   Constants.KEY_NAVIGATIONBAR_STATUS;
 
+// settingsdata (the dataShare provider behind settings.getValueSync) is not
+// guaranteed to be up when this ServiceExtAbility starts at boot. The very
+// first read can therefore return the default ('1' = 3-button) and leave the
+// side-edge BACK monitor unregistered — and because the stored value is then
+// already its final value, no 'dataChange' ever fires to correct it. So we
+// retry helper creation and re-read the mode once the provider is reachable,
+// the same retry NavigationBarViewModel already does for the nav-bar window.
+const NAV_MODE_HELPER_MAX_RETRY = 5;
+const NAV_MODE_HELPER_RETRY_MS = 1500;
+
 // Touch action codes per @ohos.multimodalInput.touchEvent.Action
 const TOUCH_CANCEL = 0;
 const TOUCH_DOWN = 1;
@@ -183,13 +193,26 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
 
   private initNavModeSubscription(): void {
     this.refreshNavMode();
+    this.createNavModeHelper(NAV_MODE_HELPER_MAX_RETRY);
+  }
+
+  private createNavModeHelper(retriesLeft: number): void {
     data_dataShare.createDataShareHelper(this.context, NAV_MODE_URI)
       .then((helper) => {
         this.dataShareHelper = helper;
         helper.on('dataChange', NAV_MODE_URI, () => this.refreshNavMode());
+        // Provider is reachable now — re-read in case the synchronous boot-time
+        // read above ran before settingsdata was up and returned the default
+        // (which would have left the BACK monitor off with no dataChange to fix
+        // it, since the stored value never changes post-boot).
+        this.refreshNavMode();
+        Log.showInfo(TAG, 'nav-mode dataShareHelper ready');
       })
       .catch((e) => {
-        Log.showError(TAG, `dataShareHelper failed: ${JSON.stringify(e)}`);
+        Log.showError(TAG, `dataShareHelper failed (retriesLeft=${retriesLeft}): ${JSON.stringify(e)}`);
+        if (retriesLeft > 0) {
+          setTimeout(() => this.createNavModeHelper(retriesLeft - 1), NAV_MODE_HELPER_RETRY_MS);
+        }
       });
   }
 
@@ -200,6 +223,7 @@ class GestureNavigationServiceExtAbility extends ServiceExtension {
     } catch (e) {
       Log.showWarn(TAG, `getValueSync failed: ${JSON.stringify(e)}`);
     }
+    Log.showInfo(TAG, `refreshNavMode raw=${raw} (current navMode=${this.navMode})`);
     if (raw !== this.navMode) {
       Log.showInfo(TAG, `navMode changed -> ${raw}`);
       this.navMode = raw;
