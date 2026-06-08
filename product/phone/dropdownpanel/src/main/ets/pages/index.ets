@@ -24,6 +24,7 @@ import RingModeIcon from '../../../../../../../features/ringmodecomponent/src/ma
 import AbilityManager from '../../../../../../../common/src/main/ets/default/abilitymanager/abilityManager';
 import image from "@ohos.multimedia.image"
 import window from '@ohos.window'
+import display from '@ohos.display'
 import Log from '../../../../../../../common/src/main/ets/default/Log'
 import Trace from '../../../../../../../common/src/main/ets/default/Trace'
 import WindowManager, { WindowType, WINDOW_SHOW_HIDE_EVENT
@@ -34,14 +35,14 @@ import CommonStyleManager from '../../../../../../../common/src/main/ets/default
 import MultimodalInputManager from '../../../../../../../common/src/main/ets/default/MultimodalInputManager'
 import HeightConfigUtils from '../../../../../../../common/src/main/ets/default/heightcofigUtils/HeightConfigUtils'
 import NavigationEvent, { NavigationCallBack } from './common/navigationEvent'
-import Notification from './notification'
-import ControlCenterComponent from './control'
+import Notification, { notifVisualHeightVp } from './notification'
+import ControlCenterComponent, { CARD_EDGE_MARGIN_VP, cardVisualHeightVp } from './control'
 import StyleManager from './common/StyleManager'
 import dataShare from '@ohos.data.dataShare';
 import settings from '@ohos.settings';
 import curves from '@ohos.curves';
 import Constants from "../../../../../../../common/src/main/ets/default/Constants";
-import { TouchMoveData, Rect, ConfigInfo } from '@ohos/common';
+import { TouchMoveData, Rect, ConfigInfo, NotificationItemData } from '@ohos/common';
 import { Context } from '@kit.AbilityKit';
 import { inputConsumer } from '@kit.InputKit';
 
@@ -91,6 +92,12 @@ enum DropdownPanelComponentName {
 // process-local (systemui HAPs share a process).
 const APP_KEY_DROPDOWN_PANEL_OPEN = 'OniroDropdownPanelOpen'
 
+// Width breakpoint (vp) above which the device is treated as a tablet: the
+// control center then renders as an iPad-style floating card in the top-right
+// instead of a full-screen panel. 600vp is the standard OHOS large-width
+// breakpoint (the 1600x2560@2.0 tablet is 800vp wide; the phone is < 450vp).
+const TABLET_MIN_WIDTH_VP = 600
+
 function publishDropdownOpen(open: boolean): void {
   AppStorage.SetOrCreate(APP_KEY_DROPDOWN_PANEL_OPEN, open)
 }
@@ -130,6 +137,18 @@ struct Index {
   // the dim so it also covers the nav-bar strip. 0 until queried.
   @State topInsetPx: number = 0;
   @State bottomInsetPx: number = 0;
+  // True on tablet-width displays (see TABLET_MIN_WIDTH_VP). Drives the
+  // iPad-style top-right control-center card: suppresses the full-bleed
+  // background, right-aligns + sizes the card, and makes the surrounding dim
+  // tap-to-close. Computed once in aboutToAppear (display width is fixed for
+  // this window). Phone keeps the full-screen panel unchanged.
+  @State isWide: boolean = false;
+  // Display height (vp) + the live notification list, used to size the per-panel
+  // card travel: the card is short and anchored at the top, so a top-drag must
+  // travel ITS height (control vs. the adaptive notification card) — not the full
+  // panel height — to track the finger 1:1. 1280 fallback if the display query fails.
+  private dispHvp: number = 1280;
+  @StorageLink('notificationList') notificationList: NotificationItemData[][] = [];
   // Handle for the pending "deactivate after slide-out" timer (see _animateTo).
   // Cleared on any reopen so a stale close can't tear down a freshly-opened
   // panel. -1 means no timer pending.
@@ -153,6 +172,18 @@ struct Index {
       Log.showInfo(TAG, `aboutToAppear, insets top=${this.topInsetPx} bottom=${this.bottomInsetPx}`)
     } catch (e) {
       Log.showWarn(TAG, `aboutToAppear, inset query failed: ${JSON.stringify(e)}`)
+    }
+    // Decide form factor once: tablet-width → iPad-style control card.
+    try {
+      let dis = display.getDefaultDisplaySync()
+      let widthVp = dis.width / dis.densityPixels
+      this.isWide = widthVp >= TABLET_MIN_WIDTH_VP
+      if (this.isWide) {
+        this.dispHvp = dis.height / dis.densityPixels
+      }
+      Log.showInfo(TAG, `aboutToAppear, widthVp=${widthVp} isWide=${this.isWide} dispHvp=${this.dispHvp}`)
+    } catch (e) {
+      Log.showWarn(TAG, `aboutToAppear, display query failed: ${JSON.stringify(e)}`)
     }
     // Establish a clean default for gesture-nav: the panel exists in the
     // tree but is not yet shown to the user.
@@ -359,16 +390,50 @@ struct Index {
     }
   }
 
+  // ----- Slide geometry (full panel vs. tablet control card) -----
+  // The tablet control card is short and anchored at the top, so its open/close
+  // slide travels only its own height (cardTravelPx) rather than the full panel
+  // height; this makes a top-drag track the finger. Phone keeps its existing
+  // behaviour exactly (drag range -H..0, show/hide off-screen at -(H+topInset)).
+  private isCardMode(): boolean {
+    return this.isWide && (this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER
+      || this.showComponentName === DropdownPanelComponentName.NOTIFICATION)
+  }
+  // Distance (px) the CURRENT card slides between fully-closed (off the top) and
+  // open: its visual height + top inset + edge margin. Control is fixed; the
+  // notification card adapts to the live notification count, so this is per-panel.
+  private cardTravelPx(): number {
+    const visualVp = (this.showComponentName === DropdownPanelComponentName.NOTIFICATION)
+      ? notifVisualHeightVp(this.dispHvp, this.notificationList.length)
+      : cardVisualHeightVp(this.dispHvp)
+    return this.topInsetPx + vp2px(visualVp + CARD_EDGE_MARGIN_VP)
+  }
+  // Distance over which finger displacement maps closed→open.
+  private dragSpanPx(): number {
+    return this.isCardMode() ? this.cardTravelPx() : this.componentOptAreaHeightPX
+  }
+  // translateY (px, negative) when fully closed, during a finger drag.
+  private dragClosedPx(): number {
+    return this.isCardMode() ? -this.cardTravelPx() : -this.componentOptAreaHeightPX
+  }
+  // translateY (px, negative) when fully closed, for show/hide spring animations.
+  private showHideClosedPx(): number {
+    return this.isCardMode()
+      ? -this.cardTravelPx()
+      : -(this.componentOptAreaHeightPX + this.topInsetPx)
+  }
+
   showSelf(showComponentName: DropdownPanelComponentName) {
     Log.showInfo(TAG, `showSelf, showComponentName: ${showComponentName}, currentY=${this.componentOptAreaTranslateY}`)
     this.cancelPendingClose()
-    // Force the panel fully off the top edge BEFORE it paints so animateTo has a
-    // valid "from" state. Off-screen distance is H + topInset (the panel is
-    // topInset taller than the body and offset up by topInset), otherwise it
-    // would start ~one status-bar-height short and pop in.
-    this.componentOptAreaTranslateY = (-(this.componentOptAreaHeightPX + this.topInsetPx)) + 'px'
-    this.backgroundOpacity = 0
+    // Set which component shows FIRST so isCardMode()/showHideClosedPx() pick the
+    // right slide geometry, then force it fully off the top edge BEFORE it paints
+    // so animateTo has a valid "from" state. Off-screen distance is the card's
+    // travel on tablet, else H + topInset (the panel is topInset taller than the
+    // body and offset up by topInset) so it doesn't pop in a status-bar-height short.
     this.showComponentName = showComponentName
+    this.componentOptAreaTranslateY = this.showHideClosedPx() + 'px'
+    this.backgroundOpacity = 0
     publishDropdownOpen(true)
     this.activatePanelWindow()
     Trace.start(Trace.CORE_METHOD_START_DROPDOWNPANEL)
@@ -396,14 +461,16 @@ struct Index {
     const area = args.area === 'left'
       ? DropdownPanelComponentName.NOTIFICATION
       : DropdownPanelComponentName.CONTROL_CENTER
-    const H = this.componentOptAreaHeightPX
-    const dy = args.dy ?? 0
+    // Set the area FIRST so dragSpanPx()/dragClosedPx() pick the card geometry.
+    this.showComponentName = area
+    const span = this.dragSpanPx()
+    const closed = this.dragClosedPx()
+    const dy = Math.max(0, Math.min(args.dy ?? 0, span))
     // Render content at finger-tracked offset.
     this.cancelPendingClose()
     this.dragActive = true
-    this.componentOptAreaTranslateY = (-H + Math.min(dy, H)) + 'px'
-    this.backgroundOpacity = Math.min(dy / H, 1)
-    this.showComponentName = area
+    this.componentOptAreaTranslateY = (closed + dy) + 'px'
+    this.backgroundOpacity = Math.min(dy / span, 1)
     publishDropdownOpen(true)
     // Perma-shown window: activate (touchable + start rendering) instead of
     // showWindow(). A mid-drag show used to steal the status bar's in-flight
@@ -413,20 +480,21 @@ struct Index {
 
   onPanelDragUpdate(args: DragArg) {
     if (!this.dragActive) return
-    const H = this.componentOptAreaHeightPX
-    const dy = Math.max(0, Math.min(args.dy ?? 0, H))
-    this.componentOptAreaTranslateY = (-H + dy) + 'px'
-    this.backgroundOpacity = dy / H
+    const span = this.dragSpanPx()
+    const closed = this.dragClosedPx()
+    const dy = Math.max(0, Math.min(args.dy ?? 0, span))
+    this.componentOptAreaTranslateY = (closed + dy) + 'px'
+    this.backgroundOpacity = dy / span
   }
 
   onPanelDragEnd(args: DragArg) {
     if (!this.dragActive) return
     this.dragActive = false
-    const H = this.componentOptAreaHeightPX
+    const span = this.dragSpanPx()
     const dy = args.dy ?? 0
     const vy = args.velocityY ?? 0
     // Commit threshold: 40% open OR moving fast enough downward.
-    const shouldOpen = (dy > H * 0.4) || (vy > 800)
+    const shouldOpen = (dy > span * 0.4) || (vy > 800)
     Log.showInfo(TAG, `onDragEnd dy=${dy} vy=${vy} → ${shouldOpen ? 'OPEN' : 'CLOSE'}`)
     if (shouldOpen) {
       this._animateTo(SHOW_ANIM_CONFIG, () => {
@@ -451,13 +519,20 @@ struct Index {
     // the panel keeps RENDERING as it slides all the way off the top edge; it's
     // torn down only after the spring settles (see _animateTo).
     WindowManager.setWindowTouchable(WindowType.DROPDOWN_PANEL, false)
+    // Clear the dim SYNCHRONOUSLY (outside any animateTo) so it disappears at
+    // once — no spring tail. On the tablet cards the dim is EXPOSED around the
+    // small top-corner card, so a spring-animated fade leaves a faint full-screen
+    // dim darkening the home screen for ~1s after the card has already gone. On
+    // phone the full-screen panel covers the dim, so an instant clear is
+    // invisible there. Unconditional so it can't be defeated by isCardMode()
+    // mis-evaluating at close time.
+    this.backgroundOpacity = 0
     this._animateTo(SHOW_ANIM_CONFIG, () => {
-      // Slide the panel FULLY off the top edge (H + topInset, not just H) so its
-      // bottom clears y=0 — otherwise it stops ~one status-bar-height short,
-      // leaving a teal strip that lingers until panelActive flips (the
-      // "stops at the line and then vanishes" glitch).
-      this.componentOptAreaTranslateY = (-(this.componentOptAreaHeightPX + this.topInsetPx)) + 'px'
-      this.backgroundOpacity = 0
+      // Slide the panel/card FULLY off the top edge so its bottom clears y=0 —
+      // otherwise it stops ~one status-bar-height short, leaving a strip that
+      // lingers until panelActive flips. showHideClosedPx() is read here (before
+      // showComponentName flips to NONE below) so the card still uses card travel.
+      this.componentOptAreaTranslateY = this.showHideClosedPx() + 'px'
       this.showComponentName = DropdownPanelComponentName.NONE
     }, true)
   }
@@ -504,27 +579,61 @@ struct Index {
           .width('100%')
           .height(`calc(100% + ${this.topInsetPx + this.bottomInsetPx}px)`)
           .offset({ y: -this.topInsetPx })
-          .backgroundColor(`rgba(0,0,0,${0.45 * this.backgroundOpacity})`)
+          // Gate the dim on there being a component to dim FOR: when the panel is
+          // closed (showComponentName === NONE) the dim must be fully transparent
+          // regardless of backgroundOpacity. panelActive lingers ~1.2s after a
+          // close so the card can finish sliding off; without this gate a stray
+          // re-dim (e.g. a snap-back-open firing after the close already
+          // committed) could raise backgroundOpacity back to 1 over a card-less
+          // panel, darkening the whole home screen until panelActive tears down
+          // ("panel disappears but the home screen stays dimmed for a second").
+          .backgroundColor(this.showComponentName === DropdownPanelComponentName.NONE
+            ? 'rgba(0,0,0,0)'
+            : `rgba(0,0,0,${0.45 * this.backgroundOpacity})`)
+          // Tablet control card floats in the top-right, so the dim is exposed:
+          // a tap outside the card dismisses (iPad behaviour). On phone the
+          // full-width panel covers the dim, so this never fires there.
+          .onClick(() => {
+            if (this.isWide) {
+              this.hideSelf()
+            }
+          })
         // Panel container — the bg image is INSIDE so it slides with the panel
         // instead of appearing as a full-screen flash.
         Stack({ alignContent: Alignment.TopStart }) {
           // Full-bleed background: NO top padding, so the blurred bg fills the
           // whole panel including the status-bar strip (y=0..topInset), covering
           // the system status bar so it isn't a second visible bar.
-          Image($r("app.media.dropdownpanel_bgc"))
-            .width('100%')
-            .height('100%')
-            .objectFit(ImageFit.Fill)
-            .blur(25)
+          // The tablet control/notification cards bring their own glass background
+          // (control.ets / notification.ets), so suppress the full-bleed blurred
+          // wallpaper there — otherwise it would cover the whole screen and hide the
+          // tap-to-close dim behind the card. Phone keeps the full-bleed background.
+          // Gate on `isWide` (a fixed form-factor flag), NOT `isCardMode()`: the
+          // latter depends on showComponentName, which hideSelf() flips to NONE
+          // synchronously mid-close — that briefly satisfied `!isCardMode()` and
+          // popped the full-height wallpaper on screen while the card had only slid
+          // up its small card-travel ("wallpaper pulls down for a moment on close").
+          // On tablet both panels are always cards, so the wallpaper is never wanted.
+          if (!this.isWide) {
+            Image($r("app.media.dropdownpanel_bgc"))
+              .width('100%')
+              .height('100%')
+              .objectFit(ImageFit.Fill)
+              .blur(25)
+          }
           Column() {
             if (this.showComponentName === DropdownPanelComponentName.NOTIFICATION) {
-              Notification({ touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data) })
+              Notification({
+                touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data),
+                isWide: this.isWide
+              })
                 .transition(this.mNotificationInsert)
                 .transition(this.mNotificationDelete)
             }
             if (this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER) {
               ControlCenterComponent({
-                touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data)
+                touchMoveCallback: (data: TouchMoveData): void => this.onTouchMove(data),
+                isWide: this.isWide
               })
                 .transition(this.mControlCenterInsert)
                 .transition(this.mControlCenterDelete)
@@ -532,6 +641,15 @@ struct Index {
           }
           .width('100%')
           .height('100%')
+          // Tablet cards: control hugs the RIGHT edge, notification the LEFT; touches
+          // outside the card fall through to the dim below (tap-to-close).
+          // HitTestMode.None keeps the card itself (a child) interactive while not
+          // blocking the dim.
+          .alignItems(this.isWide && this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER
+            ? HorizontalAlign.End
+            : (this.isWide && this.showComponentName === DropdownPanelComponentName.NOTIFICATION
+              ? HorizontalAlign.Start : HorizontalAlign.Center))
+          .hitTestBehavior(this.isCardMode() ? HitTestMode.None : HitTestMode.Default)
           // Push the panel CONTENT (its own status header + body) down so it clears
           // the status-bar avoid line. The legacy WMS clips panel foreground content
           // to the safe area (origin at the status-bar inset) — confirmed on device
@@ -557,6 +675,9 @@ struct Index {
         // (translateY = -H) carries it fully off the top edge. The content's
         // matching top padding keeps the header on-screen at y=0.
         .offset({ y: -this.topInsetPx })
+        // Tablet cards: the full-size sliding container must not eat taps outside
+        // the card — pass them through to the dim (tap-to-close).
+        .hitTestBehavior(this.isCardMode() ? HitTestMode.None : HitTestMode.Default)
       }
     }
     .width('100%')
@@ -575,41 +696,56 @@ struct Index {
         .onActionStart((e: GestureEvent) => {
           if (this.showComponentName === DropdownPanelComponentName.NONE) return
           this.closeDragActive = true
-          this.closeDragStartY = e.fingerList[0]?.localY ?? 0
+          // GestureEvent.localY is in vp; translateY / dragSpanPx() are in px, so
+          // convert to px here to keep finger displacement, the slide travel and
+          // the dim ratio in the SAME unit (a vp/px mix made dyTotal ~half its
+          // true px value: thresholds never tripped and the dim never reached 0).
+          const startVp = e.fingerList[0]?.localY
+          this.closeDragStartY = (startVp === undefined) ? 0 : vp2px(startVp)
           this.closeDragLastY = this.closeDragStartY
           this.closeDragLastT = Date.now()
           this.closeDragVelocityY = 0
         })
         .onActionUpdate((e: GestureEvent) => {
           if (!this.closeDragActive) return
-          const curY = e.fingerList[0]?.localY ?? this.closeDragLastY
+          // Panel closed mid-drag — stop mirroring the finger (don't re-dim a
+          // card-less panel).
+          if (this.showComponentName === DropdownPanelComponentName.NONE) return
+          const curVp = e.fingerList[0]?.localY
+          const curY = (curVp === undefined) ? this.closeDragLastY : vp2px(curVp)  // px
           const dyTotal = curY - this.closeDragStartY  // negative when pulling up
           const now = Date.now()
           const dt = Math.max(now - this.closeDragLastT, 1)
           this.closeDragVelocityY = ((curY - this.closeDragLastY) / dt) * 1000
           this.closeDragLastY = curY
           this.closeDragLastT = now
-          const H = this.componentOptAreaHeightPX
-          // dyTotal is negative; translateY ranges from -H (closed) to 0 (open)
-          const ty = Math.max(-H, Math.min(0, dyTotal))
+          const span = this.dragSpanPx()
+          // dyTotal is negative; translateY ranges from -span (closed) to 0 (open)
+          const ty = Math.max(-span, Math.min(0, dyTotal))
           this.componentOptAreaTranslateY = ty + 'px'
-          this.backgroundOpacity = 1 + (ty / H) // 1 at open (ty=0), 0 at closed (ty=-H)
+          this.backgroundOpacity = 1 + (ty / span) // 1 at open (ty=0), 0 at closed (ty=-span)
         })
         .onActionEnd((e: GestureEvent) => {
           if (!this.closeDragActive) return
           this.closeDragActive = false
-          const H = this.componentOptAreaHeightPX
-          const curY = e.fingerList[0]?.localY ?? this.closeDragLastY
+          // If the panel was already closed out from under this gesture (another
+          // close path committed mid-drag, flipping showComponentName to NONE),
+          // do NOT snap it back open — that re-raises the dim over a card-less
+          // panel and leaves the home screen dimmed until panelActive tears down.
+          if (this.showComponentName === DropdownPanelComponentName.NONE) return
+          const span = this.dragSpanPx()
+          const curVp = e.fingerList[0]?.localY
+          const curY = (curVp === undefined) ? this.closeDragLastY : vp2px(curVp)  // px
           const dyTotal = curY - this.closeDragStartY  // negative
           const vy = this.closeDragVelocityY            // negative = up
-          // Close only if (a) pulled up past 50% of panel height, OR
+          // Close only if (a) pulled up past 50% of the slide span, OR
           // (b) pulled past 15% AND released with a clear upward flick.
           // The 1500 px/s velocity gate filters out release-jitter; the 15%
           // minimum displacement keeps small drags that just release from
           // being interpreted as a flick.
-          const shouldClose = (dyTotal < -H * 0.5)
-            || ((dyTotal < -H * 0.15) && (vy < -1500))
-          Log.showInfo(TAG, `closeDrag end dy=${dyTotal} vy=${vy} → ${shouldClose ? 'CLOSE' : 'STAY_OPEN'}`)
+          const shouldClose = (dyTotal < -span * 0.5)
+            || ((dyTotal < -span * 0.15) && (vy < -1500))
+          Log.showInfo(TAG, `closeDrag end dy=${dyTotal} vy=${vy} span=${span} → ${shouldClose ? 'CLOSE' : 'STAY_OPEN'}`)
           if (shouldClose) {
             this.hideSelf()
           } else {
@@ -622,6 +758,9 @@ struct Index {
         .onActionCancel(() => {
           if (!this.closeDragActive) return
           this.closeDragActive = false
+          // Don't snap back open if the panel already closed mid-gesture (would
+          // re-dim a card-less panel).
+          if (this.showComponentName === DropdownPanelComponentName.NONE) return
           // Snap back to open
           this._animateTo(SHOW_ANIM_CONFIG, () => {
             this.componentOptAreaTranslateY = '0px'
