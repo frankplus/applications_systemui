@@ -23,30 +23,31 @@ import NotificationViewModel from '../../../../../../../features/noticeitem/src/
 import ResourceUtil from '../../../../../../../common/src/main/ets/default/ResourceUtil';
 import TimeManager, { TimeEventArgs, TIME_CHANGE_EVENT
 } from '../../../../../../../common/src/main/ets/default/TimeManager';
-import deviceInfo from '@ohos.deviceInfo';
 import display from '@ohos.display';
 import { NotificationItemData, TouchMoveData } from '@ohos/common';
-import { CARD_WIDTH_VP, CARD_SCALE, CARD_NATURAL_H_VP, CARD_RADIUS_VP,
-  CARD_EDGE_MARGIN_VP } from './control';
+import { cardScale, cardWidthVp, ctrlNaturalHVp, bottomReserveVp,
+  CARD_RADIUS_VP, CARD_EDGE_MARGIN_VP } from './control';
 
 const TAG = 'DropdownPanel-notification';
 const IMAGE_SIZE_L = 24;
 const BGC_SIZE_L = 40;
-const NO_NOTIFICATION_TOP_MARGIN = 40;
 const TIME_TEXT_MARGIN = 4;
 const CENTER_TITLE_MARGIN_TOP = 12;
 const TIME_BOTTOM_OFFSET = 7;
 const CENTER_MARGIN = 12;
-const deviceTypeInfo = deviceInfo.deviceType;
 
 // The notification card adapts its height to content: compact when empty (just the
 // date + "No Notification") so it isn't a big empty glass slab, tall when there are
 // notifications. Shared with index.ets so the open/close finger-drag travels the
-// right distance. Pre-scale (natural) heights; scaled down by CARD_SCALE like control.
-export const NOTIF_EMPTY_NATURAL_H_VP = 360;
-export function notifVisualHeightVp(displayHeightVp: number, count: number): number {
-  const natural = (count === 0) ? NOTIF_EMPTY_NATURAL_H_VP : CARD_NATURAL_H_VP;
-  return Math.min(Math.round(natural * CARD_SCALE), Math.floor(displayHeightVp - 96));
+// right distance. Pre-scale (natural) heights; scaled by cardScale() like control.
+const TABLET_NOTIF_EMPTY_H_VP = 360;
+const PHONE_NOTIF_EMPTY_H_VP = 220;
+export function notifVisualHeightVp(isWide: boolean, displayHeightVp: number, count: number): number {
+  const natural = (count === 0)
+    ? (isWide ? TABLET_NOTIF_EMPTY_H_VP : PHONE_NOTIF_EMPTY_H_VP)
+    : ctrlNaturalHVp(isWide);
+  return Math.min(Math.round(natural * cardScale(isWide)),
+    Math.floor(displayHeightVp - bottomReserveVp(isWide)));
 }
 
 @Component
@@ -58,149 +59,105 @@ export default struct Notification {
   @State moveY: number = 0
   @State isEnd: boolean = true
   @StorageLink('notificationList') notificationList: NotificationItemData[][] = []
-  // Set by index.ets: tablet-width → render as a top-left floating card (mirrors
-  // the control card on the right). Height adapts to notificationList (reactive).
+  // Set by index.ets: tablet-width → top-left corner card (mirror of the control
+  // card on the right); else the phone inset card at native scale. Height adapts
+  // to notificationList (reactive) on both.
   isWide: boolean = false
-  cardInnerWVp: number = CARD_WIDTH_VP / CARD_SCALE
+  @State cardScaleV: number = 1.0
+  @State cardWidthV: number = 336
+  @State cardInnerWVp: number = 336
   @State dispHvp: number = 1280   // display height (vp); 1280 fallback if query fails
 
   aboutToAppear() {
     Log.showInfo(TAG, `aboutToAppear Start`);
     AbilityManager.setContextName(AbilityManager.ABILITY_NAME_NOTIFICATION_PANEL,AbilityManager.ABILITY_NAME_DROPDOWN_PANEL);
-    if (this.isWide) {
-      try {
-        let dis = display.getDefaultDisplaySync()
-        this.dispHvp = dis.height / dis.densityPixels
-        Log.showInfo(TAG, `aboutToAppear dispHvp=${this.dispHvp}`)
-      } catch (e) {
-        Log.showWarn(TAG, `aboutToAppear, display query failed: ${JSON.stringify(e)}`)
-      }
+    // Resolve the responsive card box once. Inner width = visual / scale so the
+    // content exactly fills the card after the scale-down; height is dynamic
+    // (notification count) and computed in build(). On phone scale=1 → inner=visual.
+    try {
+      let dis = display.getDefaultDisplaySync()
+      let wVp = dis.width / dis.densityPixels
+      this.dispHvp = dis.height / dis.densityPixels
+      this.cardScaleV = cardScale(this.isWide)
+      this.cardWidthV = cardWidthVp(this.isWide, wVp)
+      this.cardInnerWVp = this.cardWidthV / this.cardScaleV
+      Log.showInfo(TAG, `aboutToAppear wVp=${wVp} dispHvp=${this.dispHvp} scale=${this.cardScaleV} ` +
+        `W=${this.cardWidthV} innerW=${this.cardInnerWVp}`)
+    } catch (e) {
+      Log.showWarn(TAG, `aboutToAppear, display query failed: ${JSON.stringify(e)}`)
     }
   }
 
   build() {
-    if (this.isWide) {
-      // iPad-style tablet notification center: a top-left frosted card (mirror of
-      // the control card on the right). The parent (index.ets) left-aligns it and
-      // dims + tap-closes the rest. Oversized content scaled down (same trick as
-      // control) so the big clock/notification items match a tablet.
+    // Frosted notification card. The parent (index.ets) positions it (top-left
+    // corner on tablet, centered inset on phone) and dims + tap-closes the rest.
+    // No custom status header — the real system status bar shows above the card.
+    Column() {
       Column() {
-        Column() {
-          Stack({ alignContent: Alignment.Bottom }) {
-            Column() {
-              CenterTitle({
-                touchMoveCallback: (data: TouchMoveData):void => this.CenterTitleTouchMoveCallback(data),
-                isWide: true
-              })
-              if (this.notificationList.length == 0) {
-                // Center "No Notification" in the compact card body below the date.
-                Column() {
-                  Text($r("app.string.no_notification"))
-                    .fontColor($r("sys.color.ohos_id_color_text_primary_contrary"))
-                    .fontSize('28fp')
-                    .fontWeight(FontWeight.Medium)
-                }
-                .layoutWeight(1)
-                .width('100%')
-                .justifyContent(FlexAlign.Center)
-              } else {
-                NotificationListComponent({listIsEnd:$isEnd})
-              }
-            }
-            .width('100%')
-            .height('100%')
-            .justifyContent(FlexAlign.Start)
-            .padding({
-              left: $r("sys.float.ohos_id_notification_margin_start"),
-              right: $r("sys.float.ohos_id_notification_margin_end")
+        Stack({ alignContent: Alignment.Bottom }) {
+          Column() {
+            CenterTitle({
+              touchMoveCallback: (data: TouchMoveData):void => this.CenterTitleTouchMoveCallback(data),
+              isWide: this.isWide
             })
-
-            if (this.notificationList.length > 0) {
-              Flex({ justifyContent: FlexAlign.Center, alignItems: ItemAlign.Center }) {
-                Image($r('app.media.ic_public_delete_filled'))
-                  .fillColor("#FFFFFF")
-                  .width(IMAGE_SIZE_L)
-                  .height(IMAGE_SIZE_L)
+            if (this.notificationList.length == 0) {
+              // Center "No Notification" in the compact card body below the date.
+              Column() {
+                Text($r("app.string.no_notification"))
+                  .fontColor($r("sys.color.ohos_id_color_text_primary_contrary"))
+                  .fontSize(this.isWide ? '28fp' : '20fp')
+                  .fontWeight(FontWeight.Medium)
               }
-              .width(BGC_SIZE_L)
-              .height(BGC_SIZE_L)
-              .margin({ bottom: $r('app.float.notification_delete_all') })
-              .borderRadius(BGC_SIZE_L)
-              .backgroundColor($r('app.color.notification_delete_all_background'))
-              .onClick(() => {
-                NotificationViewModel.removeAllNotifications();
-              })
+              .layoutWeight(1)
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+            } else {
+              NotificationListComponent({listIsEnd:$isEnd})
             }
           }
           .width('100%')
           .height('100%')
-        }
-        .width(this.cardInnerWVp)
-        .height(notifVisualHeightVp(this.dispHvp, this.notificationList.length) / CARD_SCALE)
-        .scale({ x: CARD_SCALE, y: CARD_SCALE, centerX: '0%', centerY: '0%' })
-      }
-      .width(CARD_WIDTH_VP)
-      .height(notifVisualHeightVp(this.dispHvp, this.notificationList.length))
-      .alignItems(HorizontalAlign.Start)
-      .borderRadius(CARD_RADIUS_VP)
-      .clip(true)
-      .backgroundBlurStyle(BlurStyle.Regular)
-      .backgroundColor('#4D000000')
-      .margin({ top: CARD_EDGE_MARGIN_VP, left: CARD_EDGE_MARGIN_VP })
-      .onTouch(this.touchEvent.bind(this))
-    } else {
-      Stack({ alignContent: Alignment.Bottom }) {
-        Column() {
-          Row()
-            .height(24)
-            .width('100%')
-            .backgroundColor($r("app.color.statusbar_background_color"))
-        }.height('100%')
-
-        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.Center }) {
-          Flex({ direction: FlexDirection.Column, alignItems: ItemAlign.Start, justifyContent: FlexAlign.Start }) {
-            statusBar({ touchMoveCallback: (data: TouchMoveData): void => this.touchMoveCallback(data) })
-            CenterTitle({
-              touchMoveCallback: (data: TouchMoveData):void => this.CenterTitleTouchMoveCallback(data)
-            })
-            if (this.notificationList.length == 0) {
-              Text($r("app.string.no_notification"))
-                .fontColor($r("sys.color.ohos_id_color_text_primary_contrary"))
-                .fontSize($r("sys.float.ohos_id_text_size_sub_title2"))
-                .fontWeight(FontWeight.Medium)
-                .alignSelf(ItemAlign.Center)
-                .margin({ top: NO_NOTIFICATION_TOP_MARGIN })
-            } else {
-              NotificationListComponent({listIsEnd:$isEnd})
-            }
-          }.padding({
+          .justifyContent(FlexAlign.Start)
+          .padding({
             left: $r("sys.float.ohos_id_notification_margin_start"),
             right: $r("sys.float.ohos_id_notification_margin_end")
           })
-          .height('100%')
-        }
 
-        if (this.notificationList.length > 0) {
-          Flex({ justifyContent: FlexAlign.Center, alignItems: ItemAlign.Center }) {
-            Image($r('app.media.ic_public_delete_filled'))
-              .fillColor("#FFFFFF")
-              .width(IMAGE_SIZE_L)
-              .height(IMAGE_SIZE_L)
+          if (this.notificationList.length > 0) {
+            Flex({ justifyContent: FlexAlign.Center, alignItems: ItemAlign.Center }) {
+              Image($r('app.media.ic_public_delete_filled'))
+                .fillColor("#FFFFFF")
+                .width(IMAGE_SIZE_L)
+                .height(IMAGE_SIZE_L)
+            }
+            .width(BGC_SIZE_L)
+            .height(BGC_SIZE_L)
+            .margin({ bottom: $r('app.float.notification_delete_all') })
+            .borderRadius(BGC_SIZE_L)
+            .backgroundColor($r('app.color.notification_delete_all_background'))
+            .onClick(() => {
+              NotificationViewModel.removeAllNotifications();
+            })
           }
-          .width(BGC_SIZE_L)
-          .height(BGC_SIZE_L)
-          .margin({ bottom: $r('app.float.notification_delete_all') })
-          .borderRadius(BGC_SIZE_L)
-          .backgroundColor($r('app.color.notification_delete_all_background'))
-          .onClick(() => {
-            NotificationViewModel.removeAllNotifications();
-          })
         }
+        .width('100%')
+        .height('100%')
       }
-      .width('100%')
-      .height('100%')
-      .onTouch(this.touchEvent.bind(this))
+      .width(this.cardInnerWVp)
+      .height(notifVisualHeightVp(this.isWide, this.dispHvp, this.notificationList.length) / this.cardScaleV)
+      .scale({ x: this.cardScaleV, y: this.cardScaleV, centerX: '0%', centerY: '0%' })
     }
+    .width(this.cardWidthV)
+    .height(notifVisualHeightVp(this.isWide, this.dispHvp, this.notificationList.length))
+    .alignItems(HorizontalAlign.Start)
+    .borderRadius(CARD_RADIUS_VP)
+    .clip(true)
+    .backgroundBlurStyle(BlurStyle.Regular)
+    .backgroundColor('#4D000000')
+    // Tablet hugs the left edge; phone is centered by index.ets so it needs no
+    // left margin (the side insets come from being narrower than the screen).
+    .margin({ top: CARD_EDGE_MARGIN_VP, left: this.isWide ? CARD_EDGE_MARGIN_VP : 0 })
+    .onTouch(this.touchEvent.bind(this))
   }
 
   touchEvent(event: TouchEvent) {
@@ -231,93 +188,6 @@ export default struct Notification {
     data.touchComponent = 'notification'
     if (this.touchMoveCallback) {
       this.touchMoveCallback(data)
-    }
-  }
-}
-
-// Panel's own status header — see the note on control.ets's statusBar struct.
-// Custom row (battery% + clock, white, sys.* resources only) drawn from
-// process-wide shared data; the shared icon components render blank in this HAP
-// because their `app.*` resources don't resolve here.
-@Component
-struct statusBar {
-  private touchMoveCallback: Function = () => {}
-  startX: number = 0
-  startY: number = 0
-  @State moveX: number = 0
-  @State moveY: number = 0
-  @State mTime: string = ''
-  @StorageLink('batterySoc') batterySoc: number = 100
-  unSubscriber?: unsubscribe
-
-  aboutToAppear() {
-    this.unSubscriber = EventManager.subscribe(TIME_CHANGE_EVENT, (args: TimeEventArgs) => {
-      this.mTime = TimeManager.formatTime(args.date)
-    })
-    this.mTime = TimeManager.formatTime(new Date())
-  }
-
-  aboutToDisappear() {
-    this.unSubscriber && this.unSubscriber()
-    this.unSubscriber = undefined
-  }
-
-  build() {
-    Column(){
-      Stack(){
-        // Content layer (rendered): right-aligned battery% + clock.
-        Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Center, justifyContent: FlexAlign.End }) {
-          Text(this.batterySoc + '%')
-            .fontColor('#FFFFFF')
-            .fontSize('16fp')
-            .fontWeight(FontWeight.Medium)
-            .margin({ right: 8 })
-          Text(this.mTime)
-            .fontColor('#FFFFFF')
-            .fontSize('16fp')
-            .fontWeight(FontWeight.Medium)
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: 16, right: 16 })
-        // Touch layer on top (transparent): left/right swipe-down switches panel.
-        Row(){
-          Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'left')})
-          Row(){}.width('50%').height('100%').onTouch((touchEvent) => {this.touchEvent(touchEvent, 'right')})
-        }.width('100%').height('100%')
-      }
-      .width('100%')
-      .height('100%')
-    }
-    .height(deviceTypeInfo === 'phone' ? $r("app.float.phone_status_bar_height") : $r("app.float.status_bar_height"))
-    .width('100%')
-    .padding({
-      top: $r("app.float.status_bar_padding_top_bottom"),
-      bottom: $r("app.float.status_bar_padding_top_bottom"),
-      left: $r("app.float.status_bar_padding_left_right"),
-      right: $r("app.float.status_bar_padding_left_right")
-    })
-  }
-
-  touchEvent(event: TouchEvent, touchLocation: string) {
-    if (event.type == Constants.TOUCHTYPE_DOWN) {
-      this.startX = event.touches[0].screenX
-      this.startY = event.touches[0].screenY
-      Log.showInfo(TAG, `statusBar startX: ${this.startX}, startY: ${this.startY}`)
-    } else if (event.type == Constants.TOUCHTYPE_MOVE) {
-      this.moveX = event.touches[0].screenX - this.startX
-      this.moveY = event.touches[0].screenY - this.startY
-    } else if (event.type == Constants.TOUCHTYPE_UP) {
-      Log.showInfo(TAG, `statusBar, moveX: ${this.moveX}, moveY: ${this.moveY}`)
-      if (this.moveY > 15) {
-        if (this.touchMoveCallback) {
-          if(touchLocation === 'left'){
-            this.touchMoveCallback({ 'direction': 'drop_left', 'touchComponent': 'control' })
-          }else if(touchLocation === 'right'){
-            this.touchMoveCallback({ 'direction': 'drop_right', 'touchComponent': 'notification' })
-          }
-        }
-      }
     }
   }
 }

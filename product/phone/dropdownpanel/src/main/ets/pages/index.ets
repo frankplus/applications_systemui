@@ -92,10 +92,11 @@ enum DropdownPanelComponentName {
 // process-local (systemui HAPs share a process).
 const APP_KEY_DROPDOWN_PANEL_OPEN = 'OniroDropdownPanelOpen'
 
-// Width breakpoint (vp) above which the device is treated as a tablet: the
-// control center then renders as an iPad-style floating card in the top-right
-// instead of a full-screen panel. 600vp is the standard OHOS large-width
-// breakpoint (the 1600x2560@2.0 tablet is 800vp wide; the phone is < 450vp).
+// Width breakpoint (vp) at/above which the device is treated as a tablet: the
+// frosted control/notification card then hugs a top corner with its content
+// scaled down, instead of the phone's near-full-width inset card. 600vp is the
+// standard OHOS large-width breakpoint (the 1600x2560@2.0 tablet is 800vp wide;
+// the phone is 360vp).
 const TABLET_MIN_WIDTH_VP = 600
 
 function publishDropdownOpen(open: boolean): void {
@@ -137,11 +138,11 @@ struct Index {
   // the dim so it also covers the nav-bar strip. 0 until queried.
   @State topInsetPx: number = 0;
   @State bottomInsetPx: number = 0;
-  // True on tablet-width displays (see TABLET_MIN_WIDTH_VP). Drives the
-  // iPad-style top-right control-center card: suppresses the full-bleed
-  // background, right-aligns + sizes the card, and makes the surrounding dim
-  // tap-to-close. Computed once in aboutToAppear (display width is fixed for
-  // this window). Phone keeps the full-screen panel unchanged.
+  // True on tablet-width displays (see TABLET_MIN_WIDTH_VP). The panel is a
+  // frosted card over a tap-to-close dim on BOTH form factors; isWide only picks
+  // the card GEOMETRY: tablet → fixed-width card hugging a top corner with the
+  // phone-derived content scaled down; phone → near-full-width inset card at
+  // native scale (centered). Computed once in aboutToAppear (width is fixed here).
   @State isWide: boolean = false;
   // Display height (vp) + the live notification list, used to size the per-panel
   // card travel: the card is short and anchored at the top, so a top-drag must
@@ -178,9 +179,9 @@ struct Index {
       let dis = display.getDefaultDisplaySync()
       let widthVp = dis.width / dis.densityPixels
       this.isWide = widthVp >= TABLET_MIN_WIDTH_VP
-      if (this.isWide) {
-        this.dispHvp = dis.height / dis.densityPixels
-      }
+      // Needed on BOTH form factors now: the phone panel is also a card whose
+      // open/close finger-drag travels its visual height (see cardTravelPx).
+      this.dispHvp = dis.height / dis.densityPixels
       Log.showInfo(TAG, `aboutToAppear, widthVp=${widthVp} isWide=${this.isWide} dispHvp=${this.dispHvp}`)
     } catch (e) {
       Log.showWarn(TAG, `aboutToAppear, display query failed: ${JSON.stringify(e)}`)
@@ -390,22 +391,22 @@ struct Index {
     }
   }
 
-  // ----- Slide geometry (full panel vs. tablet control card) -----
-  // The tablet control card is short and anchored at the top, so its open/close
-  // slide travels only its own height (cardTravelPx) rather than the full panel
-  // height; this makes a top-drag track the finger. Phone keeps its existing
-  // behaviour exactly (drag range -H..0, show/hide off-screen at -(H+topInset)).
+  // ----- Slide geometry (card travel) -----
+  // The control / notification card is short and anchored near the top on BOTH
+  // form factors, so its open/close slide travels only its own height
+  // (cardTravelPx) rather than the full window height; this makes a top-drag
+  // track the finger. True whenever a panel is shown.
   private isCardMode(): boolean {
-    return this.isWide && (this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER
-      || this.showComponentName === DropdownPanelComponentName.NOTIFICATION)
+    return this.showComponentName === DropdownPanelComponentName.CONTROL_CENTER
+      || this.showComponentName === DropdownPanelComponentName.NOTIFICATION
   }
   // Distance (px) the CURRENT card slides between fully-closed (off the top) and
   // open: its visual height + top inset + edge margin. Control is fixed; the
   // notification card adapts to the live notification count, so this is per-panel.
   private cardTravelPx(): number {
     const visualVp = (this.showComponentName === DropdownPanelComponentName.NOTIFICATION)
-      ? notifVisualHeightVp(this.dispHvp, this.notificationList.length)
-      : cardVisualHeightVp(this.dispHvp)
+      ? notifVisualHeightVp(this.isWide, this.dispHvp, this.notificationList.length)
+      : cardVisualHeightVp(this.isWide, this.dispHvp)
     return this.topInsetPx + vp2px(visualVp + CARD_EDGE_MARGIN_VP)
   }
   // Distance over which finger displacement maps closed→open.
@@ -520,12 +521,9 @@ struct Index {
     // torn down only after the spring settles (see _animateTo).
     WindowManager.setWindowTouchable(WindowType.DROPDOWN_PANEL, false)
     // Clear the dim SYNCHRONOUSLY (outside any animateTo) so it disappears at
-    // once — no spring tail. On the tablet cards the dim is EXPOSED around the
-    // small top-corner card, so a spring-animated fade leaves a faint full-screen
-    // dim darkening the home screen for ~1s after the card has already gone. On
-    // phone the full-screen panel covers the dim, so an instant clear is
-    // invisible there. Unconditional so it can't be defeated by isCardMode()
-    // mis-evaluating at close time.
+    // once — no spring tail. The dim is EXPOSED around the card on both form
+    // factors, so a spring-animated fade would leave a faint full-screen dim
+    // darkening the home screen for ~1s after the card has already slid away.
     this.backgroundOpacity = 0
     this._animateTo(SHOW_ANIM_CONFIG, () => {
       // Slide the panel/card FULLY off the top edge so its bottom clears y=0 —
@@ -590,37 +588,18 @@ struct Index {
           .backgroundColor(this.showComponentName === DropdownPanelComponentName.NONE
             ? 'rgba(0,0,0,0)'
             : `rgba(0,0,0,${0.45 * this.backgroundOpacity})`)
-          // Tablet control card floats in the top-right, so the dim is exposed:
-          // a tap outside the card dismisses (iPad behaviour). On phone the
-          // full-width panel covers the dim, so this never fires there.
+          // Both form factors float a card over the dim, so the dim is exposed
+          // around it: a tap outside the card dismisses (iPad / iOS behaviour).
           .onClick(() => {
-            if (this.isWide) {
-              this.hideSelf()
-            }
+            this.hideSelf()
           })
         // Panel container — the bg image is INSIDE so it slides with the panel
         // instead of appearing as a full-screen flash.
         Stack({ alignContent: Alignment.TopStart }) {
-          // Full-bleed background: NO top padding, so the blurred bg fills the
-          // whole panel including the status-bar strip (y=0..topInset), covering
-          // the system status bar so it isn't a second visible bar.
-          // The tablet control/notification cards bring their own glass background
-          // (control.ets / notification.ets), so suppress the full-bleed blurred
-          // wallpaper there — otherwise it would cover the whole screen and hide the
-          // tap-to-close dim behind the card. Phone keeps the full-bleed background.
-          // Gate on `isWide` (a fixed form-factor flag), NOT `isCardMode()`: the
-          // latter depends on showComponentName, which hideSelf() flips to NONE
-          // synchronously mid-close — that briefly satisfied `!isCardMode()` and
-          // popped the full-height wallpaper on screen while the card had only slid
-          // up its small card-travel ("wallpaper pulls down for a moment on close").
-          // On tablet both panels are always cards, so the wallpaper is never wanted.
-          if (!this.isWide) {
-            Image($r("app.media.dropdownpanel_bgc"))
-              .width('100%')
-              .height('100%')
-              .objectFit(ImageFit.Fill)
-              .blur(25)
-          }
+          // No full-bleed panel background on either form factor: the control /
+          // notification cards (control.ets / notification.ets) bring their OWN
+          // frosted-glass background, and what shows around them is the dim layer
+          // above. A full-screen image here would cover that tap-to-close dim.
           Column() {
             if (this.showComponentName === DropdownPanelComponentName.NOTIFICATION) {
               Notification({
@@ -650,18 +629,13 @@ struct Index {
             : (this.isWide && this.showComponentName === DropdownPanelComponentName.NOTIFICATION
               ? HorizontalAlign.Start : HorizontalAlign.Center))
           .hitTestBehavior(this.isCardMode() ? HitTestMode.None : HitTestMode.Default)
-          // Push the panel CONTENT (its own status header + body) down so it clears
-          // the status-bar avoid line. The legacy WMS clips panel foreground content
-          // to the safe area (origin at the status-bar inset) — confirmed on device
-          // (2026-06-03): with no padding the header renders ABOVE the line and is
-          // clipped away, while the full-bleed bg Image still overflows up to y=0
-          // (an immersive background is allowed under the status bar; foreground
-          // text is not — this holds with OR without setWindowSystemBarEnable([]),
-          // so a custom header CANNOT reach true y=0 where the real icons sit
-          // without a window_manager source patch). We pad by (topInset - 12vp)
-          // instead of the full inset so the header rides right up against that line
-          // (≈5px margin) rather than floating a status-bar-height below it; the
-          // matching .offset below keeps the bg covering the whole strip.
+          // Push the panel CONTENT (the card) down so it clears the status-bar
+          // avoid line and floats just below the real system status bar (which
+          // stays visible above it). The legacy WMS clips panel foreground content
+          // to the safe area (origin at the status-bar inset), and the matching
+          // .offset({y:-topInset}) below lifts the whole container up so the dim
+          // reaches y=0 and a full close-translate carries the card off the top
+          // edge; this padding compensates so the card itself lands below the line.
           .padding({ top: this.topInsetPx - 12 })
         }
         .width('100%')
