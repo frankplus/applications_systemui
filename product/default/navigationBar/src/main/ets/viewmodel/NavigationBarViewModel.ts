@@ -19,7 +19,7 @@ import WindowManager, { WindowType } from '../../../../../../../common/src/main/
 import getSingleInstance from '../../../../../../../common/src/main/ets/default/SingleInstanceHelper';
 import TintStateManager, { TintState, TintStateListener
 } from '../../../../../../../common/src/main/ets/default/TintStateManager';
-import { NavigationBarComponentData, NAVIGATIONBAR_HIDE_EVENT } from '../common/constants';
+import { NavigationBarComponentData, NAVIGATIONBAR_HIDE_EVENT, NAVIGATIONBAR_SHOW_EVENT } from '../common/constants';
 import dataShare from '@ohos.data.dataShare';
 import settings from '@ohos.settings';
 import commonEvent from '@ohos.commonEvent';
@@ -260,19 +260,20 @@ export default class NavigationBarViewModel {
           Log.showError(TAG, `hideWindow err: ${JSON.stringify(err)}`);
         });
       }
-      // Nudge the launcher to recompute its bottom inset for gesture mode (it
-      // then reserves the indicator-strip height). The legacy event name is
-      // kept because that is what the launcher already listens for to switch
-      // into its "gesture" layout.
-      if (gesture) {
-        commonEvent.publish(NAVIGATIONBAR_HIDE_EVENT, (err) => {
-          if (err.code) {
-            Log.showError(TAG, `${NAVIGATIONBAR_HIDE_EVENT} PublishCallBack err: ${JSON.stringify(err)}`);
-          } else {
-            Log.showInfo(TAG, `${NAVIGATIONBAR_HIDE_EVENT} Publish sucess`);
-          }
-        });
-      }
+      // Tell the launcher about the mode change. HIDE (gesture) makes it reserve
+      // the indicator-strip inset and start its swipe monitor; SHOW (3-button)
+      // makes it stop that monitor — otherwise the monitor keeps pilfering the
+      // nav bar's button taps (delivering a CANCEL instead of an UP), so the
+      // buttons appear dead until a reboot. The launcher can't read this setting
+      // itself reliably, so this push is its only dependable signal.
+      const navEvent = gesture ? NAVIGATIONBAR_HIDE_EVENT : NAVIGATIONBAR_SHOW_EVENT;
+      commonEvent.publish(navEvent, (err) => {
+        if (err.code) {
+          Log.showError(TAG, `${navEvent} PublishCallBack err: ${JSON.stringify(err)}`);
+        } else {
+          Log.showInfo(TAG, `${navEvent} Publish sucess`);
+        }
+      });
     }).catch((err) => {
       Log.showError(TAG, `resetSizeWindow err: ${JSON.stringify(err)}`);
     });

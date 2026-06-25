@@ -29,6 +29,15 @@ export default class Constants {
 
 export const NAVIGATIONBAR_HIDE_EVENT = 'systemui.event.NAVIGATIONBAR_HIDE';
 
+// Complement of NAVIGATIONBAR_HIDE_EVENT: published when 3-button mode becomes
+// active so the launcher learns the nav bar is shown again (the HIDE event only
+// ever signals gesture mode). The launcher uses it to stop its bottom-edge
+// swipe monitor, which would otherwise keep consuming the nav bar's button taps.
+// (The launcher cannot read this setting reliably itself — a dataShare helper to
+// settingsdata never resolves in that process and getValueSync serves a stale
+// cached value — so this push is the reliable signal.)
+export const NAVIGATIONBAR_SHOW_EVENT = 'systemui.event.NAVIGATIONBAR_SHOW';
+
 export class NavigationBarComponentData {
   isEnable = true;
   backgroundColor = '#00000000';
